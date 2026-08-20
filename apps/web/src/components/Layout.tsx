@@ -10,9 +10,13 @@ const NAV_ITEMS = [
   { to: '/dtr', label: 'DTR' },
 ]
 
+const ADMIN_NAV_ITEM = { to: '/admin', label: 'Admin' }
+
 export function Layout() {
   const navigate = useNavigate()
   const { user, logout } = useAuth()
+  const navItems =
+    user?.role === 'ADMIN' ? [...NAV_ITEMS, ADMIN_NAV_ITEM] : NAV_ITEMS
 
   function handleLogout() {
     logout()
@@ -25,7 +29,7 @@ export function Layout() {
         <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3">
           <span className="text-lg font-semibold text-slate-900">Teacher DTR</span>
           <nav className="flex items-center gap-1">
-            {NAV_ITEMS.map((item) => (
+            {navItems.map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}

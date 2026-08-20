@@ -1,9 +1,13 @@
 import { QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { ProtectedRoute } from '@/auth/ProtectedRoute'
+import { RequireAdmin } from '@/auth/RequireAdmin'
 import { Layout } from '@/components/Layout'
 import { queryClient } from '@/lib/query-client'
 import { AcademicPeriodsPage } from '@/pages/AcademicPeriodsPage'
+import { AdminAcademicPeriodsPage } from '@/pages/admin/AdminAcademicPeriodsPage'
+import { AdminTeacherDtrPage } from '@/pages/admin/AdminTeacherDtrPage'
+import { AdminTeachersPage } from '@/pages/admin/AdminTeachersPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { DtrDayEditorPage } from '@/pages/DtrDayEditorPage'
 import { DtrPeriodDetailPage } from '@/pages/DtrPeriodDetailPage'
@@ -35,6 +39,31 @@ function App() {
             <Route path="/dtr" element={<DtrPeriodsPage />} />
             <Route path="/dtr/:periodId" element={<DtrPeriodDetailPage />} />
             <Route path="/dtr/:periodId/:date" element={<DtrDayEditorPage />} />
+
+            <Route
+              path="/admin"
+              element={
+                <RequireAdmin>
+                  <AdminTeachersPage />
+                </RequireAdmin>
+              }
+            />
+            <Route
+              path="/admin/academic-periods"
+              element={
+                <RequireAdmin>
+                  <AdminAcademicPeriodsPage />
+                </RequireAdmin>
+              }
+            />
+            <Route
+              path="/admin/teachers/:teacherId/dtr"
+              element={
+                <RequireAdmin>
+                  <AdminTeacherDtrPage />
+                </RequireAdmin>
+              }
+            />
           </Route>
 
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
