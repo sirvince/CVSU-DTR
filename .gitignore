@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.env
+.env.local
+apps/api/storage/generated/*
+!apps/api/storage/generated/.gitkeep
+*.log
+
+# Real filled-in DTR sample used as source for the master template (contains
+# real names/attendance times) — see apps/api/scripts/build-master-template.js.
+# The scrubbed output (apps/api/storage/templates/dtr/DTR-FORMAT-MASTER.xlsx)
+# is what actually gets committed/tracked.
+/DTR-FORMAT-APRIL16-30.xlsx

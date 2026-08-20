@@ -1,0 +1,408 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Status
+
+**The backend MVP is functionally complete** (docs' DTR-001 through DTR-013, `apps/api`): NestJS + TypeORM + MySQL, covering auth, teacher profile, academic periods, weekly schedules, DTR periods, DTR calendar generation, full daily-record editing (attendance + status/exceptions), DTR validation, Excel generation against a real (scrubbed) master template, and file download — all verified end-to-end against a real MySQL instance, including reading generated `.xlsx` files back to confirm cell-level correctness. No migrations exist yet either (`synchronize: true` is still doing schema management, see "Commands" below) — worth revisiting before any real deployment.
+
+**The frontend (`apps/web`) covers every screen in the core teacher workflow**: login/register, teacher profile, academic periods, weekly schedule, DTR periods, the DTR calendar (generate/validate/generate-and-download-Excel), and the daily attendance/status editor. (Dashboard exists but hasn't been through real-browser testing yet — everything else has.) Real-browser use by the user (not just automated HTTP checks) confirmed the UI renders and works end-to-end — they registered, created a profile/academic period/schedule/DTR period, entered day data, and generated Excel files, all visible as real rows in the dev database. That same real usage caught one genuine bug: **"Generate Excel" and "Download" being two separate buttons let a stale download silently miss a day edited after the last generate** (full story under "DTR Period detail" in "Frontend (apps/web)" below) — fixed by collapsing them into one action, then re-verified by both re-reading the live-tested generation files with ExcelJS and by reproducing the edit-then-generate-then-download sequence again live. Typecheck (`tsc -b`) and lint (`oxlint`) are clean throughout.
+
+The `docs/` folder is the source of truth for requirements:
+- `docs/business-analysis-project-baseline.md` — business problem, goals, scope, MVP release criteria
+- `docs/feature(1).md` — feature-level behavior and screen-by-screen examples
+- `docs/plan(1).md` — project plan, phases, data entities
+- `docs/stack(1).md` — technology choices, module layout, API shape
+- `docs/ticket-base-detailed.md` — ticket template used for planning individual work items (also contains a worked example, DTR-005)
+
+`docs/api/` is the **implemented** API reference (endpoints, request/response shapes, exact validation rules and error conditions, one file per feature — see `docs/api/README.md` for the index) — the right place to look when building the frontend or integrating against this API. It documents the *what*; this file (`CLAUDE.md`) covers the *why* (design decisions, verification notes). Keep both in sync when the API changes.
+
+`docs/tickets/` holds individual tickets written with `docs/ticket-base-detailed.md`'s template, for work that doesn't fit the DTR-001…DTR-013 backend sequence or the DTR-014…DTR-020 reservations already made in `docs/business-analysis-project-baseline.md` §19 (History/Audit/Dashboard/OCR/Admin/Testing/Deployment) — bugs found in testing use a `BUG-0XX` id, feature enhancements use `ENH-0XX`. `BUG-001` (stale DTR Excel download — found, root-caused, and fixed live) and `ENH-001` (pre-fill attendance from schedule — built and verified live; see "Daily Attendance & Status editor" below for how it stays inside BR-004) are the first two.
+
+## What This System Is
+
+Teacher DTR (Daily Time Record) Automation System: a **teacher-side** web app that turns HR-provided attendance data into the official DTR Excel output, without changing HR's existing process or systems.
+
+Core principle: **automate the preparation, not the authority.**
+- HR remains the source of attendance truth (exported from biometric devices, distributed to teachers through existing channels — no HR integration in MVP).
+- The teacher configures an expected weekly *schedule*, then enters/verifies *actual* Arrival + Departure per day.
+- **Schedule ≠ Attendance.** The schedule must never be auto-copied into actual attendance fields — this is a hard rule referenced throughout the docs (BR-004 in the baseline doc). **One confirmed, deliberate exception exists**: ENH-001 auto-fills a freshly-generated `DtrDay`'s Arrival/Departure from its schedule at the moment `dtr/calendar/generate()` creates the row (see "DTR calendar generation" below) — explicitly requested and confirmed by the user, not a default the system chose on its own. It's scoped narrowly (fires once, at row creation, still fully editable after) and is the one place in the codebase that departs from this principle; treat it as the exception, not the pattern, when building anything else.
+- The system must not infer payroll eligibility or auto-declare suspensions/holidays — validation produces warnings for teacher review, never automatic decisions (BR-008).
+- The official DTR Excel template is the output target; the master template file must never be modified, only read and populated into a new generated workbook (BR-009).
+
+## Commands (apps/api)
+
+Run from `apps/api/`:
+
+```
+npm run start:dev     # dev server, watch mode (http://localhost:3000, global prefix /api)
+npm run build          # tsc build via nest build
+npm run lint            # eslint --fix over src/apps/libs/test
+npm run test             # unit tests (jest, *.spec.ts under src/)
+npm run test -- users.service   # run a single test file/suite by name pattern
+npm run test:cov          # unit tests with coverage
+npm run test:e2e           # e2e tests (test/*.e2e-spec.ts) — needs a real MySQL reachable via .env
+```
+
+Copy `apps/api/.env.example` to `apps/api/.env` and point `DATABASE_*` at a running MySQL before starting the app or running e2e tests — there is no in-memory/sqlite fallback. `docker-compose.yml` at the repo root brings up a MySQL container (`docker compose up -d mysql`); it maps host port **3307→3306** (not the default 3306) because this dev machine already runs a native MySQL service on 3306 — adjust `DATABASE_PORT` in `.env` accordingly, or change the compose port mapping back to `3306:3306` if your machine has no conflicting local MySQL.
+
+`synchronize: true` is enabled outside `production` (see `app.module.ts`), so entity changes apply to the dev DB schema automatically — no migrations exist yet. Add real TypeORM migrations before this ever runs against a shared/production database.
+
+Password hashing uses **bcryptjs**, not the `argon2`/bcrypt native modules the stack doc recommends — this repo's environment has no Visual Studio C++ build tools, so native `node-gyp` compilation (required by `argon2` and `bcrypt`) fails. `bcryptjs` is a pure-JS drop-in with the same API shape; switch to a native/prebuilt-binary hasher later if a build toolchain becomes available and the extra performance matters.
+
+## Architecture
+
+```
+Frontend (React + Vite + TS, not yet built)  →  Backend API (NestJS + TS)  →  MySQL
+                                                          ↓
+                                                  DTR Domain Logic
+                                                          ↓
+                                                  Excel Generator (ExcelJS)
+                                                          ↓
+                                  Existing DTR Excel Template (read-only master)
+```
+
+Key architectural rule (docs/stack(1).md §19): **DTR business logic must stay independent of Excel generation** — schedule/attendance/status logic produces a "Verified DTR" domain object first, which is then handed to the Excel generator. This separation is what allows future output formats (PDF) without touching core logic, and is called out explicitly as NFR-004 in the baseline doc. All of `dtr/calendar/` (DTR-007), `dtr/validation/` (DTR-010), and `dtr/generator/` (DTR-012) are now implemented; `src/templates/` stays an empty, deliberately-unused directory (see "Excel generation" below for why).
+
+### Backend module layout (`apps/api/src/`)
+
+```
+src/
+├── auth/            # JWT strategy/guard, login, register, /me — implemented
+├── users/            # User entity + repository access — implemented
+├── teachers/          # TeacherProfile CRUD (own profile only) — implemented (DTR-003)
+├── academic-periods/   # AcademicPeriod CRUD (own periods only) — implemented (DTR-004)
+├── schedules/            # TeacherSchedule CRUD (own schedules only) — implemented (DTR-005)
+├── dtr/
+│   ├── periods/            # DtrPeriod CRUD (own periods only) — implemented (DTR-006)
+│   ├── calendar/             # DTR calendar generation — implemented (DTR-007)
+│   ├── days/                   # DtrDay arrival/departure + status/reason/remarks editing — implemented (DTR-008/009)
+│   ├── validation/              # DTR warnings (POST /dtr/validate) — implemented (DTR-010)
+│   └── generator/                # ExcelJS generation (POST /dtr/generate) — implemented (DTR-012); cell map in dtr-excel-mapper.ts
+├── templates/                       # still an empty, unused src/ folder — deliberately not built out, see "Excel generation" below
+├── audit/                            # AuditLog entity registered; no write-path wired up yet
+└── common/                             # BaseEntity, ApiResponseDto, ResponseInterceptor, HttpExceptionFilter, enums
+```
+
+Each feature module not yet built out currently only does `TypeOrmModule.forFeature([...])` and exports it — that's the scaffold future tickets build services/controllers on top of. `dtr.module.ts` aggregates the `dtr/*` submodules into one import for `app.module.ts`.
+
+**No cross-entity TypeORM relations exist yet.** `teacherId`, `academicPeriodId`, and `dtrPeriodId` are plain UUID columns everywhere (not `@ManyToOne`/`@JoinColumn`), so there's no DB-level FK enforcement between e.g. `TeacherSchedule.academicPeriodId` and `AcademicPeriod.id`. `schedules/`, `dtr/periods/`, `dtr/calendar/`, `dtr/days/`, and `dtr/generator/` close this gap at the service layer instead: each imports the module(s) it depends on and calls `findOneForTeacher(teacherId, id)` before every create/update/read that touches a foreign id — this simultaneously validates the row exists *and* that it belongs to the requesting teacher (verified live repeatedly across every one of these modules: a second teacher gets 404, not a leak, when trying to touch the first teacher's real ids).
+
+**`dtr/calendar/` and `dtr/days/` each independently register `TypeOrmModule.forFeature([DtrDay])`** rather than one depending on the other's service, and this was a deliberate decision made when DTR-008 landed (not an oversight left over from DTR-007): `DtrCalendarService.generate()` only ever *inserts* brand-new rows for previously-nonexistent `(dtrPeriodId, date)` pairs and never touches an existing row, while `DtrDaysService.update()` only ever *updates* a row that `generate()` already created (`findOneForTeacher` 404s if it doesn't exist yet — DTR-008 has no upsert/create path of its own). Since the two write paths never touch the same row in the same operation, there's no shared-mutable-state hazard from keeping them as separate repositories; introducing a shared `DtrDaysService` dependency between the two modules would add coupling without removing a real risk. Revisit only if a future ticket needs the two to coordinate more tightly (e.g. bulk day mutations from generation).
+
+**`dtr/validation/` takes the opposite approach: it has no `DtrDay` repository of its own at all.** It's pure read/compute — `DtrValidationService` depends on `DtrCalendarModule` and calls `DtrCalendarService.findAllForTeacher(teacherId, dtrPeriodId)` (the same ownership-checked list method `GET /dtr/calendar` uses) to get the day list, then derives warnings from it in memory. This is the "single source of truth for reads" version of the pattern the note above deliberately didn't apply to writes — safe here because there's nothing to reconcile (no independent write path, no risk of the two modules disagreeing about what a `DtrDay` looks like).
+
+### Core data entities (`apps/api/src/**/entities/*.entity.ts`)
+
+```
+User (auth identity: email, passwordHash, role) ──1:1── TeacherProfile (employeeId, name, position, dept, campus)
+AcademicPeriod (teacherId, academicYear, semester, start/end date)
+  └── TeacherSchedule (teacherId, academicPeriodId, dayOfWeek, startTime, endTime)
+  └── DtrPeriod (teacherId, academicPeriodId, start/end date, label)
+       └── DtrDay (dtrPeriodId, date, schedule_*_time, arrivalTime, departureTime, status, reason, remarks) — unique on (dtrPeriodId, date)
+       └── DtrGeneration (teacherId, dtrPeriodId, version, fileName, filePath, generatedAt)
+AuditLog (userId, action, entityType, entityId, metadata)
+```
+
+**Judgment call, not spelled out in the docs:** `AcademicPeriod` is modeled as owned by a `teacherId` (self-service, one row per teacher per period) rather than a shared/admin-managed lookup table, because the MVP explicitly has no admin module. If an admin module gets built later, this will need revisiting (either keep per-teacher periods or migrate to a shared table teachers select from).
+
+All entities extend `common/entities/base.entity.ts` (uuid `id`, `createdAt`, `updatedAt`). Ownership checks (`BR-010` — only the owning teacher may modify a record) are implemented in `teachers/`, `academic-periods/`, `schedules/`, `dtr/periods/`, `dtr/calendar/`, `dtr/days/`, `dtr/generator/`, and (transitively, via `dtr/calendar/`) `dtr/validation/` (every query is scoped by the JWT's `sub`, never a route param; a lookup for another teacher's `id` returns 404, not 403, so existence isn't leaked). `AcademicPeriod` enforces a composite-unique `(teacherId, academicYear, semester)` DB constraint and a service-level `startDate < endDate` check on create/update. `TeacherSchedule` similarly enforces a composite-unique `(teacherId, academicPeriodId, dayOfWeek)` DB constraint (BR: "prevent accidental duplicates" per docs/ticket-base-detailed.md's DTR-005 example) and a service-level `startTime < endTime` check; `SchedulesService` also normalizes `"HH:mm"` input to `"HH:mm:ss"` before writing, so a create/update response's `startTime`/`endTime` matches what a later `GET` returns from the MySQL `time` column instead of differing by a trailing `:00`. `DtrPeriod` enforces a composite-unique `(teacherId, academicPeriodId, startDate, endDate)` DB constraint, a service-level `startDate < endDate` check, and — because ticket-base-detailed.md §15 explicitly calls out "Record outside academic period" as an edge case to handle — a service-level check that the DTR period's date range falls entirely within its parent `AcademicPeriod`'s date range (not spelled out as a discrete business rule anywhere, but this is the judgment call that makes it enforced code rather than an unwritten assumption). All three services with a validated-range concept reject an invalid create/update **before** persisting anything (verified live for all three: a rejected PATCH leaves the row completely unchanged).
+
+The MVP intentionally excludes subject/room/section/class-mode concepts — schedule is just day-of-week + time range. Daily attendance is intentionally simplified to **one Arrival + one Departure per day** (not AM IN/AM OUT/PM IN/PM OUT).
+
+### Daily status values
+
+`REGULAR | ONLINE | SUSPENDED | HOLIDAY | NO_CLASS | OTHER` — these drive whether Arrival/Departure are expected, but never determine payroll treatment on their own.
+
+### DTR calendar generation (`dtr/calendar/dtr-calendar.service.ts`)
+
+`generate(teacherId, dtrPeriodId)` is what turns a `DtrPeriod` + the teacher's `TeacherSchedule[]` into `DtrDay` rows (FR-005), matching docs/feature(1).md §5's example of only weekday-with-a-schedule dates appearing, weekends/unscheduled days silently excluded:
+
+1. Ownership-check the `DtrPeriod`, then pull `TeacherSchedule[]` for its `academicPeriodId` (reuses `SchedulesService.findAllForTeacher`).
+2. Walk every date from `startDate` to `endDate` inclusive, entirely in **UTC-midnight arithmetic** (`new Date(`${date}T00:00:00Z`)`, `getUTCDay()`, `setUTCDate()`) — never local-timezone `Date` methods — so the day-of-week/date-string computation can't drift by one day regardless of the server's local timezone (the same class of bug the Timezone section below warns about for display).
+3. For each date, look up a schedule by day-of-week; if none exists, skip the date entirely (no `DtrDay` row created for it) — this is what produces the "only scheduled dates appear" behavior.
+4. Insert a `DtrDay` row (snapshotting `scheduleStartTime`/`scheduleEndTime` from the `TeacherSchedule` at generation time, `status: REGULAR` default) **only for dates that don't already have one** — existing rows for that `(dtrPeriodId, date)` are never touched.
+
+This makes `generate()` **idempotent and additive-only**, verified live: calling it twice produces the same rows (same ids); adding a new weekly-schedule day and regenerating adds only the newly-scheduled dates; deleting a schedule afterward and regenerating does **not** remove or alter the days already materialized from it (their row ids are unchanged) — this is a deliberate design choice, not an oversight, so a schedule edit can never silently discard attendance/status a teacher already entered. There's no endpoint to explicitly delete a stale `DtrDay` — `dtr/days` (see "Daily attendance + status entry" below) only has `GET`/`PATCH`, no `DELETE`; still an open question for whenever this needs solving.
+
+**Known consequence, left as-is (confirmed with the user):** because a fresh day now starts auto-filled rather than blank, and status-change never auto-clears Arrival/Departure (see "Daily attendance + status entry" below), a day marked `SUSPENDED`/`HOLIDAY`/etc. *without* the teacher manually clearing the times will still carry the auto-filled schedule time — and the Excel generator (`dtr/generator/dtr-excel-mapper.ts`) writes Arrival/Departure cells whenever they're non-null regardless of status, so the generated `.xlsx` can show both a non-`REGULAR` status label *and* a clock-in/out time on the same row. Considered and explicitly deferred rather than fixed (options discussed: auto-clear on status change away from `REGULAR`, or gate the Excel/calendar-table display on `status === REGULAR`) — revisit if this causes a real problem in practice.
+
+**ENH-001 (confirmed exception to BR-004): a newly-inserted row's `arrivalTime`/`departureTime` are auto-filled from that same schedule's `startTime`/`endTime`, not left `null`.** BR-004 ("the schedule must never automatically become attendance") is emphatic and repeated across this project's docs for good reason — it's the trust model's load-bearing rule — but the user explicitly asked for and confirmed this specific exception: a fresh day should start with the scheduled time already sitting in Arrival/Departure, immediately persisted (not just a form suggestion), fully editable afterward via the normal `PATCH /dtr/days/:date` path exactly like any teacher-entered value. This is a narrower exception than it looks: it only fires once, at the moment a `DtrDay` row is first created (never on an existing row — regenerating still never touches one), so there's no ongoing risk of schedule edits silently overwriting real attendance after the fact; the additive-only/idempotent guarantees above are completely unaffected. If BR-004's wording is ever revisited project-wide, start here — this is currently the one deliberate carve-out from it.
+
+`POST /dtr/calendar/generate` (mutating) and `GET /dtr/calendar` (pure read) are deliberately separate endpoints rather than folding generation into the `GET` — docs/stack(1).md §10 only specifies the `GET`, but a `GET` that writes on every call breaks normal HTTP-caching/safety expectations for no real benefit here, since the frontend workflow already has an explicit "System Generates DTR Calendar" step (docs/business-analysis-project-baseline.md §8) it can call once after creating/editing a DTR period or schedule.
+
+### Daily attendance + status entry (`dtr/days/dtr-days.service.ts`)
+
+`UpdateDtrDayDto`/`DtrDaysService.update()` cover the full `DtrDay` edit surface (FR-006/007, BR-005/006/007) through the single shared `PATCH /dtr/days/:date?dtrPeriodId=` endpoint (matching docs/stack(1).md §10, which lists one `PATCH` for the whole day resource) — built in two tickets, DTR-008 (arrival/departure) then DTR-009 (`status`/`reason`/`remarks`), but landing as one combined DTO/method since they're the same row:
+
+- A `DtrDay` must already exist (i.e. `dtr/calendar`'s `generate()` must have materialized that date) — `GET`/`PATCH` 404 with a message pointing at calendar generation if it hasn't; there is no upsert/create path here.
+- `arrivalTime`/`departureTime` (`"HH:mm"`) use the same time-normalization pattern as `schedules/` (`"HH:mm"` → `"HH:mm:ss"` on write, so a PATCH response matches a later GET), plus a hard validation `arrivalTime < departureTime` — checked against the *effective* value after merging the DTO onto the existing row, so a partial update that only changes `arrivalTime` still gets compared against the already-stored `departureTime` (and is rejected without persisting if the combination would be invalid — verified live).
+- `status` is validated against the `DtrDayStatus` enum; `reason` (max 255 chars) and `remarks` (max 2000 chars) are free text — none of the three are required for any particular status, since BR-006 ("special statuses **may** have no Arrival/Departure") is worded as a permission, not a requirement, and docs/business-analysis-project-baseline.md §12's only explicit per-status field is `SUSPENDED`'s `Reason` example, not a hard validation rule.
+- The route param `:date` is validated against `YYYY-MM-DD` before anything else runs (malformed dates 400, not a confusing 404 or a raw DB error).
+
+**Resolves the "open question" DTR-008 left**: setting `status` to a special value (e.g. `SUSPENDED`, `ONLINE`) deliberately does **not** auto-clear an already-entered `arrivalTime`/`departureTime`, and vice versa — verified live (switching `REGULAR` → `ONLINE` on a day with `07:03`/`18:58` already set left both times untouched). Rationale: BR-008 says the system must not decide payroll/employment treatment on its own, and silently discarding data the teacher already entered would be exactly that kind of unrequested authority — "automate the preparation, not the authority" applies to the system's own writes, not just to what it tells the teacher. If a specific status should visually/logically imply cleared times, that's a frontend or DTR-010/011 (validation/preview) presentation concern, not something `dtr/days` should destructively enforce at the data layer.
+
+### DTR validation (`dtr/validation/dtr-validation.service.ts`)
+
+`validate(teacherId, dtrPeriodId)` takes the day list from `dtr/calendar` and derives non-blocking warnings per day (docs/feature(1).md §9, docs/stack(1).md §11) — reusing the same distinction the docs draw between two validation tiers: **hard input errors** (already enforced everywhere they can occur — `arrivalTime < departureTime`, valid time format, valid status enum, valid uuid/date — these reject the write outright and never reach `dtr/validation`) vs. **soft comparative warnings** (this ticket — informational, never block a save, never imply a payroll/eligibility decision per BR-008). Only `status: REGULAR` days are checked at all; a `SUSPENDED`/`HOLIDAY`/etc. day's blank Arrival/Departure is expected per BR-006, not something to flag — checking it would edge toward the system judging whether the special-status marking itself was "correct," which is explicitly not its role (BR-007/008).
+
+For a REGULAR day: `Missing Arrival` and `Missing Departure` are independent checks (each fires whenever that field is blank, regardless of whether the other is filled — matches ticket-base-detailed.md §16's DTR-specific validation checklist, which lists them as separate bullets, not one conditioned on the other); `Arrival is later than scheduled start.` / `Departure is earlier than scheduled end.` fire by comparing the stored `"HH:mm:ss"` strings against `scheduleStartTime`/`scheduleEndTime` lexicographically (valid because both are the same fixed-width zero-padded format). There's no "Invalid Time" warning from docs/feature(1).md §9's examples — unreachable in this system, since `dtr/days`' `Matches(TIME_PATTERN)` DTO validation makes it impossible to ever persist a malformed time in the first place.
+
+`POST /dtr/validate { dtrPeriodId }` returns **every** day in the period (not just the ones with warnings), each with a `warnings: string[]` field appended (empty array for a clean day) — verified live against the exact scenario from docs/feature(1).md §9 (on-time day → `[]`, late-arrival+early-departure day → both warning strings, suspended day → `[]`), plus a REGULAR day with neither Arrival nor Departure entered correctly producing both `Missing Arrival` and `Missing Departure` together.
+
+### DTR Preview (DTR-011) — no backend module, by design
+
+**No new backend code for DTR-011.** docs/stack(1).md §2 explicitly lists "DTR preview" under the **Frontend** "Main Responsibilities," and §3's backend "Suggested Modules" list (`periods/`, `calendar/`, `days/`, `validation/`, `generator/`) has no `preview/` entry — this isn't an oversight to fill in, it's the docs' own architecture saying Preview is a client-side composition, not a server endpoint. And the data need lines up: docs/feature(1).md §10's example table is exactly `Day | Arrival | Departure | Status`, which is a strict subset of what `POST /dtr/validate` already returns per day (it has all four of those fields *plus* `warnings`, and "the final preview should be based on verified data" reads naturally as "render this after the Validate step, using its output" rather than a hint that another endpoint is needed). A frontend Preview screen should call `GET /api/dtr/calendar` (or `POST /api/dtr/validate` if it also wants to surface warnings inline) — both already exist and are ownership-checked. Revisit only if a real frontend need shows up that neither endpoint can serve (e.g., a teacher-name/period-label header requiring a join against `teachers`/`academic-periods` — still just a second existing-endpoint call, not new backend logic).
+
+### Excel generation (DTR-012) (`dtr/generator/`)
+
+`apps/api/storage/templates/dtr/DTR-FORMAT-MASTER.xlsx` is now a real template — a single sheet named `DTR`, Civil Service Form No. 48 layout, derived from a real filled-in DTR export (`DTR-FORMAT-APRIL16-30.xlsx`, gitignored at the repo root — it has real people's names/attendance times in it, kept out of version control on purpose) via `apps/api/scripts/build-master-template.js` (`npm run template:build -- <source.xlsx>`). That script clears every cell that held real personal data (name, period label, the full day-grid) while preserving all formatting/merges/borders/the certification-and-signature footer, and drops the source workbook's other sheets (each one was a different real person's filled DTR). **If the official format ever changes, re-run that script against a new real sample** — don't hand-edit the master `.xlsx` directly, since the script is the only record of *why* each cell is blank vs. formatted-but-empty.
+
+**Cell map** (also documented as constants at the top of `dtr/generator/dtr-excel-mapper.ts` — keep both in sync):
+
+| Data | Cell(s) |
+|---|---|
+| Teacher name (`"LASTNAME, FIRSTNAME MIDDLENAME"`) | `D6` (merged `D6:J6`) |
+| Period label (e.g. `"August 16-31, 2026"`) | `H9` |
+| Day number 1–31 | `D17`…`D47` (static in the master — day *N* is always row `16+N`, never written by the generator) |
+| Arrival | `E{row}` ("AM Arrival") if before noon, else `G{row}` ("PM Arrival") |
+| Departure | `F{row}` ("AM Departure") if before noon, else `H{row}` ("PM Departure") |
+| Non-`REGULAR` status (+ reason, if set) | `B{row}` (merged `B{row}:C{row}`, the form's unused "shift code" column, immediately left of the Day column `D`) |
+| `REGULAR` day's scheduled shift, shorthand (e.g. `"7-7"` for `07:00`–`19:00`) | same `B{row}` cell, only when the day has no status note to write instead |
+
+**Feature added in live manual testing: the shift-note column (`B`/merged `B:C`) now also shows the teacher's scheduled shift for `REGULAR` days, not just the status text for non-`REGULAR` ones.** Requested with the exact example "August 3, 2026, schedule 7-7" — `formatScheduleShorthand()`/`formatScheduleHour()` in `dtr-excel-mapper.ts` convert `scheduleStartTime`/`scheduleEndTime` to a compact 12-hour-clock, no-AM/PM-suffix shorthand (`"07:00:00"` → `"7"`, joined as `"7-7"`; minutes included only when not on the hour, e.g. `"7:30-4:30"`). Gated on `status !== REGULAR` (existing status-note branch) vs. `status === REGULAR && scheduleStartTime && scheduleEndTime` (new branch) — the two conditions are mutually exclusive per row, so the shift note and the status note never collide in the same cell; a `REGULAR` day with no schedule snapshot (shouldn't normally happen per `dtr/calendar`'s generation rules) just leaves the cell blank rather than guessing. Verified live: a real generated `.xlsx` for a Monday `07:00–19:00` schedule read back with ExcelJS showed `B19 = "7-7"` on the August 3, 2026 row (`D19 = 3`), alongside the correct `E19`/`H19` Arrival/Departure times.
+
+**Bug found in live manual testing, fixed same session: Arrival/Departure are placed by actual clock hour, not hardcoded to E/H.** The printed form has 4 punch columns (AM IN/AM OUT/PM IN/PM OUT) for the classic 4-punch workflow, and this system's data model only ever has one Arrival + one Departure per day (docs/plan(1).md §4's explicit MVP simplification) — but the original version always wrote Arrival to `E` (AM Arrival) and Departure to `H` (PM Departure) regardless of what time they actually were, so an afternoon-only shift's Arrival showed up in the AM column and a half-day's morning Departure showed up in the PM column. Fixed with `isAfternoon()` in `dtr-excel-mapper.ts` (hour `>= 12`, so `12:00:00` itself counts as PM) — Arrival goes to `G` instead of `E` when it's afternoon, Departure goes to `F` instead of `H` when it's morning. Verified live with a real generated `.xlsx` read back with ExcelJS: an afternoon shift (`13:00`–`20:00`) landed in `G`/`H` with `E`/`F` empty; a morning shift (`06:00`–`11:00`) landed in `E`/`F` with `G`/`H` empty. Also never written: the "Under Time Hours/Minutes" columns (`I`/`J`) — computing under-time would be a payroll judgment the system must not make (BR-008); they're left for a human to fill in by hand if the school's process requires it.
+
+Excel time cells store a `"h:mm"`-formatted datetime with the date part fixed at Excel's zero-date (`1899-12-30`) — `toExcelTime()` in the mapper builds exactly that (`Date.UTC(1899, 11, 30, hour, minute)`); writing a normal "today" `Date` would display correctly by luck of the format string but store the wrong underlying value. **Gotcha discovered building `build-master-template.js`**: ExcelJS cells can share a single style object by reference (e.g. every un-styled cell in a row pointing at the same default style) — the first version of the script did `cell.numFmt = 'h:mm'` on the day-grid time columns and silently corrupted column D's day-number formatting on several rows because D and those cells shared a style object. Fixed by replacing the whole style object (`cell.style = { ...cell.style, numFmt: 'h:mm' }`) instead of mutating a property in place — same rule applies to any future code that sets `.numFmt`/`.font`/`.border` etc. directly on a template cell.
+
+**Signature-line underlines added on request, and the exact same style-object gotcha bit again while doing it.** Neither the real source export nor the master template had any borders at all above the teacher's printed name or above the verifying officer's name/title — so `build-master-template.js` now adds a bottom-border "underline" below the teacher-name cell (`D6:J6`, all 7 merged cells — a merged cell's border has to be set on every constituent cell to render as one continuous line, not just the top-left one) and another above `E56:H56` (the row directly above `"DR. AGNES C. FRANCISCO"` / `"In Charge"`, which aren't merged in the source, so a plain per-cell border spanning a width chosen to match the `"(NAME)"` caption's merge width). **First attempt used `cell.border = { ...cell.border, bottom: ... }` and silently added a bottom border to 317 cells across nearly the entire sheet** — caught immediately by diffing the rebuilt template's borders cell-by-cell against a pre-change backup (not just spot-checking the 11 target cells), which is exactly the failure mode the `numFmt` paragraph above already documents, just with `.border` instead of `.numFmt`. Restored from backup and fixed with the same established pattern: `cell.style = { ...cell.style, border: { ...cell.border, bottom: ... } }`, replacing the whole style object instead of mutating a property that might be shared. Re-ran the diff after the fix and confirmed exactly the 11 intended cells changed, nothing else. **Takeaway for next time:** any code that sets a style sub-property (`.border`, `.numFmt`, `.font`, `.alignment`, ...) on a template cell must go through `cell.style = {...}`, and the fix must be verified with a full before/after diff across the whole sheet, not just the cells that were intentionally touched — a spot-check of only the target cells would have missed this exact bug both times.
+
+**Several more underline rounds followed in the same session — added, rolled back, re-added, then adjusted; here's the current, final state.** Six more spans were added via the same `underlineRow(row, startCol, endCol)` helper and safe `cell.style = {...}` pattern as the two above, then rolled back on request, then a hand-edit directly on `DTR-FORMAT-MASTER.xlsx` in Excel (while only the original 2 were active) landed in a broken, inconsistent state — a live demonstration of why direct hand-edits don't work: an edit outside `build-master-template.js` either gets silently wiped by the next rebuild, or lands incompletely because Excel's UI doesn't make it obvious when a border op only touched part of a merged/multi-cell range. Fixed by rebuilding from the script, the six were re-added, and then adjusted to their final form. **Current active set — 6 underline spans total, on top of the day-grid table itself:**
+
+| Span | What it's for |
+|---|---|
+| `D6:J6` | Teacher-name signature line, above the `"(NAME)"` caption |
+| `E56:I56` | Verifying officer's signature line, above `"DR. AGNES C. FRANCISCO"` / `"In Charge"` (widened by one column, `H56`→`I56`, per a later adjustment) |
+| `G9:J9` | Blank after `"For the month of "` (narrowed from the original `E9:H9`) |
+| `I10:J10` | Blank after `"Regular days"` |
+| `I11:J11` | Blank after `"Saturdays "` |
+| `E54:I54` | Teacher's own certification signature line — blank row 54, directly above `"Verified as to..."` (row 55), for signing under the `"I CERTIFY..."` paragraph (rows 50-52) |
+
+**Day-grid font, on request: `B17:J48` uniformly set to Calibri 16.** Same script, a new `DAY_GRID_FONT = { name: 'Calibri', size: 16 }` applied via `cell.style = { ...cell.style, font: { ...cell.font, ...DAY_GRID_FONT } }` — spreads each cell's *own* existing font first so properties like `bold` (present on some cells, e.g. `J48`) survive the override; only `name`/`size` actually change. Verified with a full-sheet diff across borders, fonts, *and* values (not just borders this time, since this was the first non-border style edit) — exactly 231 cells' font changed (some of the 288 cells in the 9×32 range already happened to already be Calibri 16, hence no diff for those), confined to rows 17–48 and columns B–J with nothing outside that range touched, and zero unexpected value changes. Confirmed live: generated a real `.xlsx` and read it back with ExcelJS — day number (`D17`), a real arrival time (`E34`), and a cell that was already bold (`J48`) all came back `Calibri`/`16` with `J48`'s `bold: true` preserved; the teacher-name cell (`D6`, outside the range) was confirmed untouched, still its original `Arial`/`14`/`bold`.
+
+Explicitly removed and **not** currently underlined: `E10:G10` (was the blank after `"Official hours for arrival"`), `F11:G11` (was after `"and departure"`), `F55:J55` (was after `"Verified as to the prescribe office hours:"`). Every round was verified with a full-sheet before/after border diff (never just spot-checking the cells intentionally touched) and a live generation through the running API read back with ExcelJS. **If any of these 6 ever need to change again: edit the `underlineRow(...)` calls in `build-master-template.js`, never the `.xlsx` directly, then `npm run template:build -- ../../DTR-FORMAT-APRIL16-30.xlsx` and verify with the same full-sheet border diff.**
+
+**A DTR period must fall within a single calendar month** — `assertSingleCalendarMonth()` rejects (400) anything else before touching the template, because the master is physically a 31-row single-month grid with nowhere to put a second month's days. This is a real limitation of the paper-form layout, not an arbitrary app restriction, and matches how the docs' own examples (and this system's semi-monthly `DtrPeriod`s) never cross a month boundary in practice.
+
+`DtrGeneratorService.generate(teacherId, dtrPeriodId)`: ownership-checks the period (`DtrPeriodsService`), loads the teacher's profile (`TeachersService.findByUserId` — 404 if no profile yet, since there's no name to put on the form), gets the day list (`DtrCalendarService.findAllForTeacher`, the same one `dtr/calendar`/`dtr/validation` use), populates a **freshly-loaded** copy of the master (never the same in-memory workbook across calls — reading `DTR_TEMPLATE_PATH` fresh every time is what keeps the on-disk master untouched, verified live), and writes the result to `STORAGE_PATH` under a **random uuid filename** (`crypto.randomUUID()`) — deliberately *not* the human-readable `DTR_<LASTNAME>_...` name, so regenerating the same period (verified live: version 1 → 2) never overwrites a prior version's file on disk. The human-readable name is stored separately on the `DtrGeneration` row's `fileName` column, used as the download's `Content-Disposition` filename — matches the doc's exact convention `DTR_<LASTNAME>_<FIRSTNAME-MIDDLE>_<PERIOD>.xlsx`, e.g. `DTR_DALLEGO_JOHN-VINCENT_AUG-16-31-2026.xlsx` (verified live, byte-for-byte match). `version` is `1 + (existing DtrGeneration rows for this dtrPeriodId)`.
+
+`POST /api/dtr/generate { dtrPeriodId }` returns the `DtrGeneration` record (metadata only, not the file bytes — see download below). 404 for a bogus/not-owned `dtrPeriodId` or a teacher with no profile yet; 400 for a cross-month period.
+
+**Download (DTR-013)**: `GET /api/dtr/generate/:id/download` — same controller/module as generate, since it's the natural next call once you have a `DtrGeneration.id` from the `generate()` response (no separate list/history endpoint needed — see the `GET /dtr/generations` note below). `DtrGeneratorService.resolveDownload(teacherId, id)` ownership-checks the generation row (`findGenerationForTeacher`, ownership-scoped like every other module here — 404, not a leak, when a second teacher tries a real generation id that isn't theirs, verified live), then `fs.access()`-checks the file still exists on disk before streaming — resurfaced as a clean 404 ("generate it again") rather than an ugly Express/`ENOENT` error if it's ever missing. The controller method uses `@Res() res: Response` and Express's `res.download(filePath, fileName)` to stream the bytes with the correct `Content-Disposition`/`Content-Type`/`Content-Length` headers, deliberately **bypassing the global `ResponseInterceptor`** (which only wraps JSON bodies) — thrown exceptions still go through the normal `HttpExceptionFilter` first, since they happen before `res.download()` is ever called, so error responses still come back as the standard `{ success: false, ... }` envelope while success responses are raw file bytes (verified live: bogus id → JSON 404 envelope; malformed uuid → JSON 400; real id → 200 with binary body, correct headers, and — read back with ExcelJS — a byte-identical, fully valid workbook matching what `generate()` produced).
+
+`src/templates/` (docs/stack(1).md §3's suggested top-level module, sibling of `dtr/`) stayed empty/unused — template-loading is a few lines (`workbook.xlsx.readFile(configService.get('dtr.templatePath'))`) directly in `DtrGeneratorService`, and there's currently exactly one template (one sheet, one format) with no versioning/selection logic that would justify a dedicated module. Revisit if a second template variant (a different official form) is ever needed.
+
+### Timezone
+
+All school-facing dates/times use `Asia/Manila`. DTR dates and Arrival/Departure are local-school-time concepts — UTC conversion must never shift the displayed calendar date or time. `createdAt`/`updatedAt` timestamps still need explicit timezone-aware handling.
+
+### Security review (both apps)
+
+A manual security pass (no automated diff-review skill available — this repo isn't yet a git repository) covered auth, ownership checks, DTOs, file/download handling, Excel generation, CORS/headers, and both apps' `npm audit`. Two real findings, fixed and verified live the same session; the rest are documented gaps, not yet acted on.
+
+**Fixed:**
+- **Hardcoded fallback JWT secret with no production guard** (`config/configuration.ts`) — `JWT_SECRET`/`JWT_REFRESH_SECRET` silently fell back to hardcoded, source-visible dev strings (`'dev-secret-change-me'` etc.) if the env vars weren't set, with nothing analogous to `app.module.ts`'s `synchronize !== production` guard stopping that from reaching a real deployment — anyone could forge a valid JWT for any teacherId/role. Fixed: `configuration()` now throws at startup if `NODE_ENV=production` and either secret is still at its default value. Verified live: `NODE_ENV=production node -e "require('./config/configuration').default()"` throws with a clear message; normal `development` boot (the running dev server) is unaffected.
+- **Excel/CSV formula injection (CWE-1236)** via unsanitized free text written straight into cell values in `dtr-excel-mapper.ts`: `formatTeacherName()`'s `lastName` (no character restriction beyond length) is the *first* thing written to `D6`, and `DtrPeriod.label` (also unrestricted free text) is written directly to `H9` with no prefix — a value starting with `=`, `+`, `-`, or `@` becomes a live formula in some spreadsheet apps when the generated `.xlsx` is opened, and this file is explicitly built to be trusted and opened by someone else (HR), making it a realistic phishing/exfil vector. (The shift-note column's `reason` was never actually exploitable this way — it's always prefixed with the status enum, e.g. `"SUSPENDED - ..."`, so it can never be the first character — but it's sanitized too now for defense-in-depth against future format changes.) Fixed with `sanitizeForExcel()` — prefixes a leading `'` on any value starting with `=`/`+`/`-`/`@`/tab/CR, which forces spreadsheet apps to render it as literal text. Verified live: generated a real `.xlsx` with `lastName: '=HYPERLINK("http://evil.example","ClickMe")'` and `label: '+cmd|calc'`, read back with ExcelJS — both cells came back `type: String` (not `Formula`), values `"'=HYPERLINK(...), MAL"` and `"'+cmd|calc"`, i.e. neutralized. Unit tests added in `dtr-excel-mapper.spec.ts` and `config/configuration.spec.ts`.
+
+**Documented, not yet fixed (flagged to the user, deferred by their choice):**
+- No rate limiting anywhere (`@nestjs/throttler` isn't installed) — same gap as the "Refresh tokens and rate limiting... not yet implemented" note above, confirmed still open.
+- `AuthService.validateUser()` skips `bcrypt.compare` entirely when the email doesn't exist but runs it when it does — a timing side-channel for email enumeration on top of `/auth/register`'s explicit `409 "already exists"`, which enumerates directly.
+- `app.enableCors()` in `main.ts` has no options → wildcard origin. Low practical impact today (Bearer token, not cookies) but should be locked to the real frontend origin before deployment.
+- No `helmet` (or equivalent) — no `X-Content-Type-Options`/`X-Frame-Options`/HSTS etc.
+- `npm audit` on `apps/api`: moderate transitive `uuid` (<11.1.1) advisory via `exceljs`, no non-breaking fix available yet. `apps/web`: 0 vulnerabilities.
+- `JwtStrategy.validate()` never re-checks the user still exists/is active against the DB — bounded by the 15-minute access-token TTL, but there's no revocation path at all yet.
+- Frontend stores the JWT in `localStorage` (`auth/token-storage.ts`) — standard XSS-theft tradeoff (`httpOnly` cookies avoid it but need CSRF protection instead). Not currently exploitable: grepped all of `apps/web/src` for `dangerouslySetInnerHTML`/`eval`/`innerHTML` and found none: React's default JSX escaping covers every free-text field rendered from the API.
+
+**Confirmed solid, not just assumed:** every ownership check derives `teacherId` from the JWT `sub` via `@CurrentUser()` — grepped for any endpoint trusting a client-supplied `teacherId` and found none (no IDOR path). All 8 feature controllers have `@UseGuards(JwtAuthGuard)` at the class level, verified individually. Zero raw/string-concatenated SQL anywhere — TypeORM repository/query-builder usage only. Global `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true })` blocks mass assignment. The Excel download path resolves through a server-generated random UUID (`crypto.randomUUID()`), never user input — no path traversal. `.env` is correctly gitignored at both the root and `apps/api` level.
+
+## API Shape
+
+All routes are under a global prefix `/api` (set in `main.ts`), which docs/stack(1).md §10 doesn't show — keep that prefix in mind when comparing routes against the docs. Every response is wrapped by `ResponseInterceptor`/`HttpExceptionFilter` into `{ success, data, message }` or `{ success: false, message, errors }` (matches the shape in docs/stack(1).md §10 and ticket-base-detailed.md §12).
+
+Implemented:
+
+```
+POST   /api/auth/register   { email, password } → { accessToken }   (not in the docs — added because MVP has no admin/seeding path to create the first accounts)
+POST   /api/auth/login      { email, password } → { accessToken }
+GET    /api/auth/me         (JWT-protected) → decoded token payload {sub, email, role}
+GET    /api/health          → { status: 'ok' }
+
+GET    /api/me/profile      (JWT-protected) → own TeacherProfile, 404 if not created yet
+POST   /api/me/profile      (JWT-protected) → create own TeacherProfile, 409 if one already exists or employeeId is taken
+PATCH  /api/me/profile      (JWT-protected) → partial-update own TeacherProfile, 404 if none exists yet
+```
+
+There is no `DELETE /me/profile` — a teacher profile isn't something the docs describe deleting (FR-002: "reused across DTR periods"); revisit only if a real deletion use case shows up.
+
+```
+GET    /api/academic-periods         (JWT-protected) → own AcademicPeriod[], newest startDate first
+GET    /api/academic-periods/:id     (JWT-protected) → own AcademicPeriod, 404 if missing or not owned
+POST   /api/academic-periods         (JWT-protected) → create; 400 if startDate >= endDate, 409 if (academicYear, semester) already exists for this teacher
+PATCH  /api/academic-periods/:id     (JWT-protected) → partial update; same 400/409/404 rules
+DELETE /api/academic-periods/:id     (JWT-protected) → 404 if missing/not owned, else { id }
+```
+
+`:id` params are validated with `ParseUUIDPipe` (malformed ids → 400, not 404/500). docs/stack(1).md §10 only lists `GET`/`POST` for `/academic-periods`, but `PATCH`/`DELETE` were added anyway since teachers will inevitably need to fix a typo'd year or remove a period created by mistake — the same full-CRUD treatment ticket-base-detailed.md's DTR-005 example already gives schedules.
+
+```
+GET    /api/schedules                        (JWT-protected) → own TeacherSchedule[], ordered by dayOfWeek; optional ?academicPeriodId= filter
+GET    /api/schedules/:id                    (JWT-protected) → own TeacherSchedule, 404 if missing or not owned
+POST   /api/schedules                        (JWT-protected) → create; 404 if academicPeriodId doesn't exist/isn't owned by this teacher, 400 if startTime >= endTime, 409 if (academicPeriodId, dayOfWeek) already has a schedule
+PATCH  /api/schedules/:id                    (JWT-protected) → partial update; same 400/404/409 rules (academicPeriodId ownership is only re-checked if it's actually being changed)
+DELETE /api/schedules/:id                    (JWT-protected) → 404 if missing/not owned, else { id }
+```
+
+```
+GET    /api/dtr/periods                      (JWT-protected) → own DtrPeriod[], newest startDate first; optional ?academicPeriodId= filter
+GET    /api/dtr/periods/:id                  (JWT-protected) → own DtrPeriod, 404 if missing or not owned
+POST   /api/dtr/periods                      (JWT-protected) → create; 404 if academicPeriodId doesn't exist/isn't owned, 400 if startDate >= endDate or the range falls outside the academic period's date range, 409 if the exact (academicPeriodId, startDate, endDate) already exists
+PATCH  /api/dtr/periods/:id                  (JWT-protected) → partial update; same 400/404/409 rules (academicPeriodId ownership only re-checked if it's actually being changed; the academic-period-range check always re-runs since dates may have changed)
+DELETE /api/dtr/periods/:id                  (JWT-protected) → 404 if missing/not owned, else { id }
+```
+
+```
+GET    /api/dtr/calendar                     (JWT-protected) → own DtrDay[] for the given ?dtrPeriodId=, ordered by date; read-only, does not generate
+POST   /api/dtr/calendar/generate            (JWT-protected) → { dtrPeriodId } in body; idempotently materializes DtrDay rows for scheduled dates in that period, returns the full DtrDay[] afterward; 404 if dtrPeriodId doesn't exist/isn't owned
+```
+
+`POST /dtr/calendar/generate` isn't in docs/stack(1).md §10 (only `GET /dtr/calendar` is listed) — added because calendar generation is a genuine mutation (it creates `DtrDay` rows) and folding that into a `GET` would violate normal HTTP semantics for no benefit; see "DTR calendar generation" above for the full rationale and the idempotency/additive-only guarantees.
+
+```
+GET    /api/dtr/days/:date?dtrPeriodId=     (JWT-protected) → own DtrDay for that period+date; 404 if not generated yet or not owned, 400 if :date isn't YYYY-MM-DD
+PATCH  /api/dtr/days/:date?dtrPeriodId=     (JWT-protected) → { arrivalTime?, departureTime?, status?, reason?, remarks? }; 400 on bad time format, invalid status enum value, arrivalTime >= departureTime (checked against the merged, not just submitted, values), or reason/remarks over their length limits; same 404/400 rules as GET
+```
+
+`dtrPeriodId` is a required query param on both — docs/stack(1).md §10 shows `GET/PATCH /dtr/days/:date` with no period qualifier, but since `DtrDay.date` is only unique per `(dtrPeriodId, date)` (not globally per teacher), an unqualified date lookup would be ambiguous the moment a teacher has more than one DTR period; same `?dtrPeriodId=` pattern already used by `/dtr/calendar`. See "Daily attendance + status entry" above for the full field-by-field behavior.
+
+```
+POST   /api/dtr/validate                    (JWT-protected) → { dtrPeriodId } in body; every DtrDay in the period with a `warnings: string[]` field appended; 404 if dtrPeriodId doesn't exist/isn't owned
+```
+
+See "DTR validation" above for exactly which warnings fire and why — matches docs/stack(1).md §10's `POST /dtr/validate` path and method exactly.
+
+```
+POST   /api/dtr/generate                    (JWT-protected) → { dtrPeriodId } in body; returns the DtrGeneration record (metadata, not file bytes — see "Excel generation" above); 404 if dtrPeriodId doesn't exist/isn't owned or the teacher has no profile yet, 400 if the period spans more than one calendar month
+```
+
+Matches docs/stack(1).md §10's `POST /dtr/generate` path and method exactly.
+
+```
+GET    /api/dtr/generate/:id/download       (JWT-protected) → streams the generated .xlsx (Content-Disposition attachment, the human-readable fileName); 400 on a malformed :id, 404 if not found/not owned/no longer on disk
+```
+
+Not in docs/stack(1).md §10 at all (its API list has no download route — it stops at `POST /dtr/generate`/`GET /dtr/generations`), so the path and the "reuse the generate controller" decision are both DTR-013 design calls, not something copied from the docs — see "Excel generation" above for the full reasoning. `GET /dtr/generations` (history listing across all past generations for a teacher/period) is deliberately still not built — it's DTR-014 ("History," P1/"Should Have" per docs/business-analysis-project-baseline.md §16), outside the DTR-001…DTR-013 MVP build order this file tracks; `generate()`'s response already gives the caller the `id` it needs to immediately download the file it just made, which is all DTR-013 needs.
+
+## Frontend (`apps/web`)
+
+React + Vite + TypeScript + Tailwind CSS v4 + React Router + TanStack Query + React Hook Form + Zod + Axios — matches docs/stack(1).md §2's recommended stack. Scaffolded fresh via `npm create vite@latest -- --template react-ts`, which on this machine's npm registry state produced a notably bleeding-edge toolchain (React 19.2, Vite 8, **TypeScript ~6.0**, and `oxlint` instead of ESLint as the default linter) — worth knowing if something looks unfamiliar; it's current tooling, not a misconfiguration. `npm run build` (`tsc -b && vite build`) and `npm run lint` (`oxlint`) are both clean.
+
+### Commands (apps/web)
+
+```
+npm run dev      # dev server (default http://localhost:5173)
+npm run build    # tsc -b && vite build
+npm run lint      # oxlint
+npm run preview    # serve the production build locally
+```
+
+Copy `.env.example` to `.env` and set `VITE_API_BASE_URL` (defaults to `http://localhost:3000/api`) before running — there's no fallback baked into the code.
+
+**Port gotcha specific to this dev machine**: `apps/api`'s own `.env.example` defaults to `APP_PORT=3000`, but **this machine already runs Grafana as a Windows service on port 3000** — the same class of "another service already squats this port" issue as MySQL-on-3306 (see "Commands (apps/api)" above). The symptom is confusing: the API's own `npm run start:dev` can silently fail to bind while `curl`/the frontend happily get a *200 or 401 response* back from Grafana instead, which looks superficially like a working API until you notice the response body doesn't match `docs/api/`'s envelope at all. Point both `apps/api/.env`'s `APP_PORT` and `apps/web/.env`'s `VITE_API_BASE_URL` at `3001` (or any free port) on this machine specifically.
+
+### Structure
+
+```
+src/
+├── api/            # one file per backend feature — thin wrappers around apiClient calls,
+│                      typed to the ApiResponse<T> envelope, unwrapping `.data.data` — plus
+│                      a *-schema.ts zod file per form, mirroring the backend DTOs in docs/api/
+├── auth/           # token-storage.ts (localStorage), useAuth.ts (login/register/logout +
+│                      GET /auth/me via TanStack Query), ProtectedRoute.tsx
+├── components/     # generic UI primitives (Button, TextField, Select, TextArea, Modal,
+│                      Alert, PageHeader, StatTile, Layout) — no feature-specific logic
+├── lib/            # api-client.ts (axios instance + interceptors), errors.ts
+│                      (getErrorMessage/resolveErrorMessage), query-client.ts, date.ts
+├── pages/          # one file per route
+└── types/          # one file per feature — plain interfaces matching apps/api's entities
+```
+
+`api/*.ts` and `types/*.ts` are split by feature to mirror `docs/api/*.md` 1:1 — if you're adding a new backend endpoint, the frontend counterpart's file names should already be obvious from that mapping.
+
+### Core plumbing worth knowing about
+
+- **`lib/api-client.ts`**: a single axios instance. Request interceptor attaches `Authorization: Bearer <token>` from `localStorage` when present. Response interceptor auto-clears the token and hard-redirects to `/login` on `401` — but **only** when the failed request actually carried an `Authorization` header, so a bad-credentials `401` from `POST /auth/login` itself (which has no auth header) doesn't trigger a redirect loop back to the page it's already on.
+- **`lib/errors.ts`**: `getErrorMessage(error)` reads `apps/api`'s `{ success: false, message, errors }` envelope (`docs/api/README.md`) for display. `resolveErrorMessage(error)` is the async variant needed specifically around `downloadDtrExcel` — axios doesn't parse an error body as JSON when the request used `responseType: 'blob'` (as the file download does), so a failed download's `error.response.data` is still a raw `Blob` and has to be read as text and `JSON.parse`d manually to recover the real message.
+- **`auth/useAuth.ts`**: `enabled: hasToken` gates the `GET /auth/me` query so it never fires with no token; `ProtectedRoute` does a synchronous `localStorage` check only (no loading spinner) to avoid a flash of protected content, and relies on the `api-client.ts` interceptor above to catch an actually-invalid/expired token once a real request is made.
+- **`lib/date.ts`**: `dayOfWeekLabel()` parses dates via `new Date(`${date}T00:00:00Z`).getUTCDay()` — the same UTC-midnight approach `dtr-calendar.service.ts` uses server-side, so the frontend's day-of-week display can't drift by one day relative to what the backend computed, regardless of the browser's local timezone.
+- **`api/dtr-generation.ts`**'s `downloadDtrExcel()`: the download endpoint returns raw file bytes with no `success/data/message` envelope and needs an `Authorization` header, so a plain `<a href>` can't be used — it fetches as a `Blob` through the authenticated `apiClient`, then triggers a save via a throwaway `URL.createObjectURL` + synthetic `<a download>` click, matching `docs/api/dtr-generation.md`'s note that this is the one non-JSON endpoint in the API.
+
+### Per-screen notes
+
+- **Dashboard, `/dashboard`**: no dedicated backend endpoint — composes `GET /academic-periods` (picks the newest as "current"), `GET /schedules`, `GET /dtr/periods`, and `POST /dtr/validate` (used as a read-derived TanStack Query, not really a mutation, to get scheduled/completed/warning counts) client-side. Same reasoning the backend's DTR-011 (Preview) conclusion already established — see "DTR Preview (DTR-011)" above — applied one level further, since the docs never specified a dashboard endpoint either.
+- **Academic Periods / Schedule / DTR Periods**: all three follow the same list-plus-modal-form CRUD pattern (`components/Modal.tsx`), each backed by its `docs/api/*.md` file's exact validation rules mirrored into a local zod schema — client-side validation is a UX nicety, the backend remains the enforced source of truth (a rejected submit still surfaces the backend's exact error message via `getErrorMessage`).
+- **DTR Period detail, `/dtr/:periodId`**: the busiest screen — wires up calendar generation, validation, and Excel generation+download in one place, matching how a teacher would actually use them together (generate → fill in days via the linked day editor → validate → generate & download Excel). Validating replaces the plain calendar rows with the warnings-annotated ones in local state; regenerating the calendar clears any stale validation result rather than leaving it looking current.
+
+  **The calendar table's Arrival/Departure columns get the same ENH-001 schedule pre-fill treatment, as a read-only display.** A `REGULAR` row with no saved `arrivalTime`/`departureTime` yet shows its `scheduleStartTime`/`scheduleEndTime` in muted (`text-slate-400`) type instead of the usual `formatTime`'s `"—"` — `renderAttendanceCell()` picks the saved value if present, else the schedule value (muted) for a `REGULAR` day, else `"—"`. Purely presentational: the table reads `DtrDay` fields already on hand from `GET /dtr/calendar`, writes nothing, and has no form/submit involved at all — an even lighter touch than the Day Editor's pre-filled `<input>`, since there's no state to accidentally persist. Verified live: a freshly-generated period with one `REGULAR` day never touched (muted schedule time shown), one `REGULAR` day with real saved arrival/departure (shown in normal dark text, not the schedule), and one `SUSPENDED` day (still `"—"`, no pre-fill) — all four combinations render correctly side by side in the same table.
+
+  **"Generate Excel" and "Download" are one button (`generateAndDownloadMutation`), not two — this was a real bug found in live testing, not a preemptive design choice.** The first version had them as separate actions: click "Generate Excel" → a "Download {fileName}" button appears → click it. That button's `fileName`/`id` came from whatever the *last* "Generate Excel" click produced — so editing another day *after* generating, then clicking the now-stale "Download" button, silently downloaded a file missing that edit. Verified this exact sequence against the live-tested data in the DB: `dtr_generations` version 1 (generated before any day was edited) was correctly blank; versions 2 and 3 (generated after each edit) correctly included them when read back with ExcelJS — the backend was never wrong, but the two-button UI made it easy to download the wrong version. Fixed by making a single click always do `generateDtrExcel()` then immediately `downloadDtrExcel()` on the fresh result, so there's no stale intermediate state a later day-edit can invalidate. Re-verified live: edited a day, clicked the combined button once, and the resulting immediate download had that edit (`E40`/`H40` for the edited date, read back with ExcelJS).
+- **Daily Attendance & Status editor, `/dtr/:periodId/:date`**: one combined form for arrival/departure/status/reason/remarks, matching `dtr-days.md`'s single shared `PATCH` endpoint. Deliberately does **not** clear arrival/departure fields client-side when `status` changes to a special value — mirrors the backend's explicit "no auto-clear" decision (see "Daily attendance + status entry" above); if that visual behavior is ever wanted, it needs to be a deliberate product decision, not an accidental side effect of a naive form reset.
+
+  **ENH-001, built — two parts.** Originally shipped as a client-side-only "pre-fill" (unsaved form default, required an explicit Save to persist, per BR-004). The user then explicitly asked for something stronger and confirmed the BR-004 exception: the schedule time should be **auto-filled and actually persisted** the moment a day is generated, not just suggested in the form. That moved the auto-fill into the backend (`dtr/calendar/dtr-calendar.service.ts` — see "DTR calendar generation" above), which made the old client-side pre-fill-with-hint logic largely moot for newly-generated days (their `arrivalTime`/`departureTime` are no longer `null` by the time the editor loads them). Left in place, unchanged, as a **legacy-data fallback** (`arrivalPrefilled`/`departurePrefilled` in `DtrDayEditorPage.tsx`) for any `DtrDay` row generated before this backend change existed, so an old blank row still shows a sensible starting point instead of a truly empty field.
+
+  **Second part: editing Arrival shifts Departure by the same amount, preserving the scheduled shift duration.** `register('arrivalTime', { onChange: handleArrivalTimeChange })` calls `shiftTimeByScheduleDuration()` (`lib/date.ts`) — computes the day's `scheduleEndTime - scheduleStartTime` duration and applies it to whatever the teacher just typed into Arrival, then `setValue('departureTime', ...)`. E.g. schedule `07:00–19:00` (12h), teacher edits Arrival to `07:30` → Departure follows to `19:30`. This only fires on an actual user edit to the Arrival `<input>` (RHF's `onChange` on `register`, not the `values`-driven reset), so it never runs on page load.
+
+  **Bug found in live manual testing, fixed same session:** the first version re-shifted Departure from the schedule duration on *every* Arrival edit, with no memory of a manual Departure edit in between — so the flow "edit Arrival → manually correct Departure → fix a typo in Arrival" silently threw the manually-entered Departure away, snapping it back to the shifted value. Fixed with `departureManuallyEditedRef` (a `useRef`, reset on navigating to a different `date`): Departure's own `register('departureTime', { onChange: handleDepartureTimeChange })` sets the ref to `true` on a genuine user edit (a plain `setValue()` call, like the auto-shift uses, does **not** fire a field's registered `onChange`, so the auto-shift itself never trips this flag); `handleArrivalTimeChange` checks the ref and skips the shift once it's set. Verified live: edited Arrival to `07:30` (Departure auto-shifted to `19:30`), manually set Departure to `15:00`, then edited Arrival again to `07:35` — Departure correctly stayed `15:00` instead of snapping to `19:35`.
+
+  Verified live end-to-end against a real MySQL-backed session: `POST /dtr/calendar/generate` created rows with `arrivalTime`/`departureTime` already equal to the schedule's `startTime`/`endTime` (confirmed via the raw API response, not just the UI); the Day Editor loaded that day showing `07:00`/`19:00` with no "unsaved" hint (it's real data now); editing Arrival to `07:30` live-updated Departure to `19:30` in the form; manually overriding Departure to `20:00` afterward held that value; clicking Save persisted `arrivalTime: "07:30:00"`, `departureTime: "20:00:00"` exactly, confirmed via `GET /dtr/days/:date`.
+
+## MVP Scope Boundaries (do not build beyond these without checking)
+
+Explicitly **out of scope for MVP**: biometric device integration, direct HR database access, automatic suspension/holiday declaration, automatic payroll eligibility determination, HR accounts, OCR, admin dashboard, notifications, PDF output, DTR history/versioning/audit log. These are P1+/future — see `docs/business-analysis-project-baseline.md` §16 and `docs/feature(1).md` §16 for the full priority breakdown before adding anything not in P0.
+
+## Working Ticket-by-Ticket
+
+New feature work should be scoped as a ticket following `docs/ticket-base-detailed.md`'s structure (objective, business rules, in/out of scope, API contract, acceptance criteria as Given/When/Then, definition of done). The recommended build order (also the dependency order) is:
+
+```
+DTR-001 Project Setup [done] → DTR-002 Auth [done] → DTR-003 Teacher Profile [done] → DTR-004 Academic Period [done]
+→ DTR-005 Weekly Schedule [done] → DTR-006 DTR Period [done] → DTR-007 DTR Calendar Generation [done]
+→ DTR-008 Daily Attendance Entry [done] → DTR-009 Daily Status/Exceptions [done] → DTR-010 Validation [done]
+→ DTR-011 DTR Preview [done — no backend code] → DTR-012 Excel Generator [done] → DTR-013 Excel Download [done]
+```
+
+DTR-001/002 here means: Nest project scaffolded, TypeORM/MySQL wired up, all core entities defined, JWT auth with register/login/me working end-to-end (verified against a live MySQL container). Refresh tokens and rate limiting from docs/stack(1).md §12 are not yet implemented.
+
+DTR-003 here means: `GET/POST/PATCH /api/me/profile` implemented and unit-tested (`teachers.service.spec.ts`), plus end-to-end-verified against live MySQL for: create, fetch, partial update, duplicate-profile conflict, duplicate-`employeeId` conflict (both the pre-check and the DB-unique-constraint fallback path), validation-error responses, unauthenticated-request rejection, and cross-teacher isolation.
+
+DTR-004 here means: full `/api/academic-periods` CRUD implemented and unit-tested (`academic-periods.service.spec.ts`), plus end-to-end-verified against live MySQL for: empty-list, create, `startDate < endDate` rejection (create and update — including confirming a rejected update leaves the row unchanged), duplicate `(academicYear, semester)` rejection, get-one, malformed-uuid rejection, 404-not-403 on cross-teacher access (get/update/delete all return 404 for another teacher's period, not a leak), and delete.
+
+DTR-005 here means: full `/api/schedules` CRUD implemented and unit-tested (`schedules.service.spec.ts`), plus end-to-end-verified against live MySQL for: rejecting a schedule against a nonexistent/not-owned `academicPeriodId` (both a bogus uuid and, critically, another teacher's *real* academic period id — the cross-module ownership check `SchedulesService` → `AcademicPeriodsService.findOneForTeacher` closes the "no FK relations" gap noted above), invalid time format, `startTime < endTime` rejection (create and update, including confirming a rejected update leaves the row unchanged), duplicate `(academicPeriodId, dayOfWeek)` rejection, list with and without the `?academicPeriodId=` filter, get-one, update (including that ownership is only re-checked when `academicPeriodId` actually changes), cross-teacher isolation on get/delete, and delete.
+
+DTR-006 here means: full `/api/dtr/periods` CRUD implemented and unit-tested (`dtr-periods.service.spec.ts`), plus end-to-end-verified against live MySQL for: rejecting a bogus `academicPeriodId`, `startDate < endDate` rejection, rejecting a date range that falls outside the parent academic period's range (on both create and update — including confirming a rejected update leaves the row unchanged), duplicate exact-date-range rejection, list with and without the `?academicPeriodId=` filter, get-one, update, and cross-teacher isolation (including a second teacher being unable to attach a DTR period to the first teacher's real academic period id).
+
+DTR-007 here means: `dtr/calendar/` implemented and unit-tested (`dtr-calendar.service.spec.ts`) — `GET /api/dtr/calendar` (read) and `POST /api/dtr/calendar/generate` (idempotent, additive-only materialization; full algorithm and rationale under "DTR calendar generation" above) — plus end-to-end-verified against live MySQL for: a realistic Mon/Wed/Fri weekly schedule against a 16-day DTR period correctly producing exactly the 7 matching weekday dates (not weekends, not unscheduled days) with the right per-day schedule snapshot times, regeneration being a true no-op the second time (same row ids), adding a new schedule day and regenerating picking up only the newly-scheduled dates, deleting a schedule afterward and regenerating leaving already-materialized days completely untouched (same row id for the affected date), 404 on a bogus `dtrPeriodId`, and cross-teacher isolation on both `GET` and `generate`.
+
+DTR-008 here means: `dtr/days/` implemented and unit-tested (`dtr-days.service.spec.ts`) — `GET`/`PATCH /api/dtr/days/:date?dtrPeriodId=` for arrival/departure only — plus end-to-end-verified against live MySQL for: fetching an already-generated day, 404 on a date that was never scheduled/generated, 400 on a malformed `:date`, 404 on a bogus `dtrPeriodId`, setting both arrival and departure with `"HH:mm"` → `"HH:mm:ss"` normalization, partial update leaving the untouched field alone, rejecting `arrivalTime >= departureTime` both when both are submitted together and when only one is submitted and would conflict with the other's *already-stored* value (both cases confirmed to leave the row completely unmodified), and cross-teacher isolation on both `GET` and `PATCH` (confirmed the target row was untouched after a rejected cross-teacher `PATCH` attempt).
+
+DTR-009 here means: `UpdateDtrDayDto`/`DtrDaysService.update()` extended (same file, same endpoint — see "Daily attendance + status entry" above) with `status`/`reason`/`remarks`, plus end-to-end-verified against live MySQL for: setting `SUSPENDED` with `reason`+`remarks` matching docs/feature(1).md §7's worked example exactly, rejecting an invalid `status` enum value, rejecting an over-length `reason`, `HOLIDAY` with no reason/remarks (matching the docs' minimal example), a partial update touching only `reason` leaving `status`/`remarks`/arrival/departure all untouched, and — the specific behavior this ticket had to decide — switching `status` from `REGULAR` to `ONLINE` on a day with arrival/departure already entered leaving both times completely unchanged (the "no auto-clear" design decision, with rationale, is under "Daily attendance + status entry" above), plus cross-teacher isolation on the status-editing path specifically.
+
+DTR-010 here means: `dtr/validation/` implemented and unit-tested (`dtr-validation.service.spec.ts`) — `POST /api/dtr/validate` (full behavior under "DTR validation" above) — plus end-to-end-verified against live MySQL against a realistic 3-day period matching docs/feature(1).md §9's exact scenario: a fully on-time REGULAR day → no warnings, a REGULAR day with both late arrival and early departure → both warning strings verbatim, a `SUSPENDED` day → no warnings despite blank Arrival/Departure, a REGULAR day with neither Arrival nor Departure entered → both `Missing Arrival` and `Missing Departure` together, 404 on a bogus `dtrPeriodId`, and cross-teacher isolation.
+
+DTR-011 here means: confirmed and documented (no new code) — see "DTR Preview (DTR-011) — no backend module, by design" above for the full reasoning; docs/stack(1).md §2 places DTR preview under Frontend responsibilities, not the backend module list, and the data it needs is already a strict subset of what `POST /dtr/validate` (or `GET /dtr/calendar`) returns.
+
+DTR-012 here means: `dtr/generator/` implemented and unit-tested (`dtr-excel-mapper.spec.ts` — the pure cell-mapping logic: name/period-label formatting, filename convention, cross-month rejection, and a fake-worksheet-object test of `populateDtrSheet`'s cell writes) — `POST /api/dtr/generate` (full cell map and design decisions under "Excel generation (DTR-012)" above) — plus end-to-end-verified against **real MySQL and a real generated `.xlsx` read back with ExcelJS** (not just HTTP status codes): the response's `fileName` matched docs/feature(1).md's exact convention byte-for-byte (`DTR_DALLEGO_JOHN-VINCENT_AUG-16-31-2026.xlsx`), the generated file's `D6`/`H9`/day-row cells matched a realistic Mon/Wed/Fri scenario (on-time day, late-arrival+early-departure day recorded as-entered with no editorializing, a `SUSPENDED` day with blank Arrival/Departure and its reason written to the shift-note column) exactly, the on-disk **master template was unchanged** after generating (`D6`/`H9`/day cells still `null` — confirmed BR-009 live, not just by code inspection), regenerating the same period bumped `version` to 2 with a *new* unique on-disk file (no overwrite), a period spanning two calendar months was rejected with 400 before touching the template, a teacher with no profile yet got a clean 404 instead of a crash, and cross-teacher isolation on generate. Also built (not part of the ticket's runtime code, but necessary groundwork): `scripts/build-master-template.js`, which derives the actual template committed to `storage/templates/dtr/` from a real filled-in DTR export the user provided — see "Excel generation" above for what it does and the shared-style-object corruption bug it caught and fixed along the way. `templates/` (`src/`) stays empty — see the note above on why.
+
+DTR-013 here means: `GET /api/dtr/generate/:id/download` implemented and unit-tested (`dtr-generator.service.spec.ts` — `findGenerationForTeacher` and `resolveDownload`, with `node:fs/promises` mocked) — full behavior and design decisions under "Excel generation" above (reusing the `dtr/generate` controller/module rather than a new `dtr/generations` resource; `@Res()` bypassing the JSON-wrapping interceptor for success responses while exceptions still get the normal envelope) — plus end-to-end-verified against **real MySQL, a real generated file on disk, and an actual HTTP download** (not just status codes): correct `Content-Disposition`/`Content-Type`/`Content-Length` response headers, the downloaded bytes read back with ExcelJS and confirmed to be a fully valid, byte-identical workbook matching what `generate()` produced (name, period label, arrival/departure all correct), 404-as-JSON-envelope for a bogus id (confirming exceptions thrown before `res.download()` still route through the normal `HttpExceptionFilter` even on an `@Res()` route), 400 for a malformed uuid, 401 unauthenticated, and cross-teacher isolation (a second teacher gets 404, not the file, for the first teacher's real generation id).
+
+**This completes the backend MVP** (docs' DTR-001 through DTR-013 — see "Project Status" at the top). The frontend (`apps/web`, React + Vite + TS per docs/stack(1).md §2) doesn't exist yet — that's the next major body of work, followed by hardening items already flagged throughout this file: real TypeORM migrations (currently `synchronize: true`), refresh tokens/rate limiting (docs/stack(1).md §12), and the open questions noted inline (stale `DtrDay` cleanup, whether `dtr/calendar`/`dtr/days` should consolidate their `DtrDay` write paths, the `AcademicPeriod` ownership model if an admin module ever gets built).

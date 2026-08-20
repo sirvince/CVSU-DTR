@@ -1,0 +1,8 @@
+export enum DtrDayStatus {
+  REGULAR = 'REGULAR',
+  ONLINE = 'ONLINE',
+  SUSPENDED = 'SUSPENDED',
+  HOLIDAY = 'HOLIDAY',
+  NO_CLASS = 'NO_CLASS',
+  OTHER = 'OTHER',
+}
