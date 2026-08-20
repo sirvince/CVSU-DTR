@@ -12,6 +12,7 @@ type MockRepository = Partial<Record<keyof Repository<DtrDay>, jest.Mock>>;
 const createMockRepository = (): MockRepository => ({
   findOne: jest.fn(),
   save: jest.fn(),
+  remove: jest.fn(),
 });
 
 describe('DtrDaysService', () => {
@@ -201,6 +202,38 @@ describe('DtrDaysService', () => {
       expect(result.status).toBe(DtrDayStatus.ONLINE);
       expect(result.arrivalTime).toBe('07:00:00');
       expect(result.departureTime).toBe('19:00:00');
+    });
+  });
+
+  describe('remove', () => {
+    it('ownership-checks the DTR period, then removes the day', async () => {
+      const day = { dtrPeriodId: 'dp-1', date: '2026-08-21' };
+      repository.findOne!.mockResolvedValue(day);
+      repository.remove!.mockResolvedValue(day);
+
+      await service.remove('teacher-1', 'dp-1', '2026-08-21');
+
+      expect(dtrPeriodsService.findOneForTeacher).toHaveBeenCalledWith(
+        'teacher-1',
+        'dp-1',
+      );
+      expect(repository.remove).toHaveBeenCalledWith(day);
+    });
+
+    it('throws NotFoundException when the day does not exist, and does not call remove', async () => {
+      repository.findOne!.mockResolvedValue(null);
+
+      await expect(
+        service.remove('teacher-1', 'dp-1', '2026-08-21'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(repository.remove).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed date before touching the DB', async () => {
+      await expect(
+        service.remove('teacher-1', 'dp-1', 'not-a-date'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(dtrPeriodsService.findOneForTeacher).not.toHaveBeenCalled();
     });
   });
 });

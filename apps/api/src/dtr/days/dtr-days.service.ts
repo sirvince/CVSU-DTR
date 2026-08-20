@@ -75,6 +75,31 @@ export class DtrDaysService {
     return this.dtrDayRepository.save(day);
   }
 
+  // Resolves the "no DELETE" gap this module was originally built without
+  // (see dtr-calendar.service.ts's generate() — there was previously no way
+  // to remove a stale/unwanted DtrDay row at all). Added specifically so a
+  // teacher can remove an auto-created holiday row that doesn't apply to
+  // them; not restricted to holiday-status rows though, since there's no
+  // principled reason a teacher shouldn't be able to remove any day of
+  // their own data — same trust-the-teacher stance as the no-auto-clear
+  // decision in update() above.
+  //
+  // Deliberately NOT idempotent against calendar regeneration: if the
+  // removed date still matches a holiday (or a schedule) when
+  // DtrCalendarService.generate() next runs, it will be re-created, since
+  // generate() only ever checks "does a row already exist for this date,"
+  // not "did a teacher previously remove one." Acceptable for now — no
+  // tombstone/soft-delete concept exists in this schema — but worth
+  // revisiting if this turns out to be a common annoyance in practice.
+  async remove(
+    teacherId: string,
+    dtrPeriodId: string,
+    date: string,
+  ): Promise<void> {
+    const day = await this.findOneForTeacher(teacherId, dtrPeriodId, date);
+    await this.dtrDayRepository.remove(day);
+  }
+
   private assertValidDateFormat(date: string): void {
     if (!DATE_PATTERN.test(date)) {
       throw new BadRequestException('date must be in YYYY-MM-DD format');

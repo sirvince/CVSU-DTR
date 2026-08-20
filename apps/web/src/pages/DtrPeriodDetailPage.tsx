@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { DTR_CALENDAR_QUERY_KEY, fetchDtrCalendar, generateDtrCalendar } from '@/api/dtr-calendar'
-import { fetchDtrDay } from '@/api/dtr-days'
+import { deleteDtrDay, fetchDtrDay } from '@/api/dtr-days'
 import { fetchDtrPeriod } from '@/api/dtr-periods'
 import { downloadDtrExcel, generateDtrExcel } from '@/api/dtr-generation'
 import { validateDtrPeriod } from '@/api/dtr-validation'
@@ -61,6 +61,26 @@ export function DtrPeriodDetailPage() {
     // step) and a Blob-typed error (from the download step) — see lib/errors.ts.
     onError: async (error) => setGenerateDownloadError(await resolveErrorMessage(error)),
   })
+
+  // Mainly for removing an auto-created holiday row that doesn't apply to
+  // this teacher (see CLAUDE.md's "Automatic Philippine holidays" section)
+  // — not restricted to holiday-status rows, works on any day.
+  const deleteDayMutation = useMutation({
+    mutationFn: (date: string) => deleteDtrDay(periodId!, date),
+    onSuccess: (_data, date) => {
+      queryClient.setQueryData(
+        [...DTR_CALENDAR_QUERY_KEY, periodId],
+        (days: DtrDay[] | undefined) => days?.filter((d) => d.date !== date),
+      )
+      setValidated((prev) => prev?.filter((d) => d.date !== date) ?? null)
+    },
+  })
+
+  function handleDeleteDay(day: DtrDay | DtrDayWithWarnings) {
+    if (window.confirm(`Remove ${day.date} from the calendar?`)) {
+      deleteDayMutation.mutate(day.date)
+    }
+  }
 
   if (!periodId) {
     return <Alert variant="error">No DTR period specified.</Alert>
@@ -124,6 +144,7 @@ export function DtrPeriodDetailPage() {
         <Alert variant="error">{getErrorMessage(generateCalendarMutation.error)}</Alert>
       )}
       {validateMutation.isError && <Alert variant="error">{getErrorMessage(validateMutation.error)}</Alert>}
+      {deleteDayMutation.isError && <Alert variant="error">{getErrorMessage(deleteDayMutation.error)}</Alert>}
       {generateDownloadError && <Alert variant="error">{generateDownloadError}</Alert>}
       {generateAndDownloadMutation.isSuccess && (
         <Alert variant="success">
@@ -169,7 +190,10 @@ export function DtrPeriodDetailPage() {
                     <td className="px-4 py-2">{dayOfWeekLabel(day.date)}</td>
                     <td className="px-4 py-2">{renderAttendanceCell(day.arrivalTime, day.scheduleStartTime, day.status)}</td>
                     <td className="px-4 py-2">{renderAttendanceCell(day.departureTime, day.scheduleEndTime, day.status)}</td>
-                    <td className="px-4 py-2">{day.status}</td>
+                    <td className="px-4 py-2">
+                      {day.status}
+                      {day.reason && <div className="text-xs text-slate-400">{day.reason}</div>}
+                    </td>
                     {validated && (
                       <td className="px-4 py-2">
                         {'warnings' in day && day.warnings.length > 0 ? (
@@ -184,19 +208,28 @@ export function DtrPeriodDetailPage() {
                       </td>
                     )}
                     <td className="px-4 py-2 text-right">
-                      <Link to={`/dtr/${periodId}/${day.date}`}>
+                      <div className="flex justify-end gap-2">
+                        <Link to={`/dtr/${periodId}/${day.date}`}>
+                          <Button
+                            variant="secondary"
+                            onClick={() => {
+                              void queryClient.prefetchQuery({
+                                queryKey: ['dtr-day', periodId, day.date],
+                                queryFn: () => fetchDtrDay(periodId!, day.date),
+                              })
+                            }}
+                          >
+                            Edit
+                          </Button>
+                        </Link>
                         <Button
-                          variant="secondary"
-                          onClick={() => {
-                            void queryClient.prefetchQuery({
-                              queryKey: ['dtr-day', periodId, day.date],
-                              queryFn: () => fetchDtrDay(periodId!, day.date),
-                            })
-                          }}
+                          variant="danger"
+                          onClick={() => handleDeleteDay(day)}
+                          isLoading={deleteDayMutation.isPending && deleteDayMutation.variables === day.date}
                         >
-                          Edit
+                          Remove
                         </Button>
-                      </Link>
+                      </div>
                     </td>
                   </tr>
                 ))}

@@ -19,3 +19,10 @@ export async function updateDtrDay(
   })
   return data.data!
 }
+
+// Mainly for removing an auto-created holiday row that doesn't apply to a
+// given teacher (see CLAUDE.md's "Automatic Philippine holidays" section) —
+// not restricted to holiday-status rows, a teacher can remove any day.
+export async function deleteDtrDay(dtrPeriodId: string, date: string): Promise<void> {
+  await apiClient.delete(`/dtr/days/${date}`, { params: { dtrPeriodId } })
+}

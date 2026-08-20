@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -40,5 +41,15 @@ export class DtrDaysController {
     @Body() dto: UpdateDtrDayDto,
   ) {
     return this.dtrDaysService.update(user.sub, query.dtrPeriodId, date, dto);
+  }
+
+  @Delete(':date')
+  async remove(
+    @CurrentUser() user: JwtPayload,
+    @Param('date') date: string,
+    @Query() query: QueryDtrDayDto,
+  ) {
+    await this.dtrDaysService.remove(user.sub, query.dtrPeriodId, date);
+    return { date };
   }
 }

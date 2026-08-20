@@ -5,6 +5,7 @@ import { DtrDay } from '../days/entities/dtr-day.entity';
 import { DtrPeriodsModule } from '../periods/dtr-periods.module';
 import { DtrCalendarController } from './dtr-calendar.controller';
 import { DtrCalendarService } from './dtr-calendar.service';
+import { PhHolidaysService } from './ph-holidays.service';
 
 @Module({
   imports: [
@@ -13,7 +14,7 @@ import { DtrCalendarService } from './dtr-calendar.service';
     SchedulesModule,
   ],
   controllers: [DtrCalendarController],
-  providers: [DtrCalendarService],
+  providers: [DtrCalendarService, PhHolidaysService],
   exports: [DtrCalendarService],
 })
 export class DtrCalendarModule {}
