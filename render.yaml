@@ -1,0 +1,64 @@
+# Render Blueprint for the API. Import this repo on Render (New +
+# -> Blueprint) and it pre-fills the service below; you still need to fill
+# in the `sync: false` values by hand in the Render dashboard (they're
+# secrets/connection details this file deliberately doesn't carry).
+#
+# The frontend (apps/web) is NOT defined here — it's a static build meant
+# for Cloudflare Pages (or similar), configured separately in that host's
+# dashboard (root dir apps/web, build command `npm run build`, publish dir
+# `dist`), not as a Render service.
+services:
+  - type: web
+    name: dtr-api
+    runtime: docker
+    rootDir: apps/api
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /api/health
+    disk:
+      # Persists generated DTR .xlsx files (STORAGE_PATH) across deploys/
+      # restarts. Requires a paid plan (the "starter" plan above) — Render's
+      # free tier has no disk support. Only storage/generated is persisted;
+      # storage/templates (the master template) ships baked into the image
+      # via the Dockerfile and doesn't need a volume.
+      name: dtr-generated-storage
+      mountPath: /app/storage/generated
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # The deployed Cloudflare Pages URL, e.g. https://cvsu-dtr.pages.dev
+      # — set this AFTER the frontend is deployed and you know its real
+      # URL; the app refuses to boot in production without it.
+      - key: CORS_ORIGIN
+        sync: false
+      # Managed MySQL (Aiven or similar) connection details.
+      - key: DATABASE_HOST
+        sync: false
+      - key: DATABASE_PORT
+        sync: false
+      - key: DATABASE_NAME
+        sync: false
+      - key: DATABASE_USER
+        sync: false
+      - key: DATABASE_PASSWORD
+        sync: false
+      # Paste the provider's CA cert contents here if it requires SSL
+      # (Aiven does); leave unset otherwise.
+      - key: DATABASE_SSL_CA
+        sync: false
+      # Render can generate strong random values for these automatically.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_ACCESS_EXPIRES_IN
+        value: 15m
+      - key: JWT_REFRESH_EXPIRES_IN
+        value: 7d
+      - key: DTR_TEMPLATE_PATH
+        value: storage/templates/dtr/DTR-FORMAT-MASTER.xlsx
+      - key: STORAGE_PATH
+        value: storage/generated
+      # APP_PORT is deliberately omitted — Render injects its own PORT,
+      # which configuration.ts already prefers over APP_PORT.
