@@ -31,11 +31,10 @@ describe('configuration', () => {
     expect(() => configuration()).toThrow(/JWT_REFRESH_SECRET/);
   });
 
-  it('does not throw in production once both secrets and CORS_ORIGIN are set', () => {
+  it('does not throw in production once both secrets are set', () => {
     process.env.NODE_ENV = 'production';
     process.env.JWT_SECRET = 'a-real-secret';
     process.env.JWT_REFRESH_SECRET = 'a-real-refresh-secret';
-    process.env.CORS_ORIGIN = 'https://example.pages.dev';
 
     expect(() => configuration()).not.toThrow();
   });
@@ -48,21 +47,23 @@ describe('configuration', () => {
     expect(() => configuration()).not.toThrow();
   });
 
-  // Security: without this, main.ts would silently fall back to a wide-open
-  // CORS policy in production instead of failing loudly.
-  it('throws when NODE_ENV=production and CORS_ORIGIN is unset', () => {
+  // CORS_ORIGIN is deliberately NOT validated here — this factory is also
+  // imported by data-source.ts (the migration CLI), which has no use for
+  // it. The production "must be set" guard lives in main.ts instead, right
+  // next to the app.enableCors() call that actually consumes it (see
+  // main.ts for why, and the incident that prompted moving it).
+  it('never throws over CORS_ORIGIN, set or not, production or not', () => {
     process.env.NODE_ENV = 'production';
     process.env.JWT_SECRET = 'a-real-secret';
     process.env.JWT_REFRESH_SECRET = 'a-real-refresh-secret';
     delete process.env.CORS_ORIGIN;
 
-    expect(() => configuration()).toThrow(/CORS_ORIGIN/);
+    expect(() => configuration()).not.toThrow();
   });
 
-  it('does not throw outside production even with CORS_ORIGIN unset', () => {
-    process.env.NODE_ENV = 'development';
+  it('passes corsOrigin through unset as undefined, not an empty string', () => {
     delete process.env.CORS_ORIGIN;
 
-    expect(() => configuration()).not.toThrow();
+    expect(configuration().corsOrigin).toBeUndefined();
   });
 });

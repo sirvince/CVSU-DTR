@@ -12,10 +12,18 @@ export default () => {
   // silently running with them in production would let anyone forge a valid
   // JWT for any teacherId/role (full account takeover) — fail startup loudly
   // instead of booting with a known-guessable signing key. Mirrors the
-  // production guard app.module.ts already has on `synchronize`. Also fail
-  // fast if CORS_ORIGIN is unset in production — the alternative is silently
-  // falling back to a wide-open CORS policy in main.ts, which defeats the
-  // point of restricting it.
+  // production guard app.module.ts already has on `synchronize`.
+  //
+  // Deliberately NOT validated here: CORS_ORIGIN. This factory is also
+  // imported by data-source.ts (the standalone TypeORM CLI config used by
+  // migration:run:prod), which only needs database.* — a missing
+  // CORS_ORIGIN has nothing to do with running a migration, and gating it
+  // here broke `npm run migration:run:prod` in production with a
+  // "CORS_ORIGIN must be set" error that had nothing to do with the actual
+  // problem (found live on a real Render deploy). The equivalent guard now
+  // lives in main.ts, right before app.enableCors() — the one place that
+  // actually needs corsOrigin — so only the real HTTP server's boot is
+  // gated on it, not the migration CLI's.
   if (
     nodeEnv === 'production' &&
     (jwtSecret === DEV_JWT_SECRET ||
@@ -24,9 +32,6 @@ export default () => {
     throw new Error(
       'JWT_SECRET and JWT_REFRESH_SECRET must be set to non-default values when NODE_ENV=production',
     );
-  }
-  if (nodeEnv === 'production' && !corsOrigin) {
-    throw new Error('CORS_ORIGIN must be set when NODE_ENV=production');
   }
 
   return {
@@ -37,8 +42,8 @@ export default () => {
     port: parseInt(process.env.PORT ?? process.env.APP_PORT ?? '3000', 10),
     timezone: process.env.APP_TIMEZONE ?? 'Asia/Manila',
     // Unset (undefined) locally — main.ts falls back to a permissive dev
-    // policy in that case. Guaranteed set here whenever NODE_ENV=production,
-    // per the guard above.
+    // policy in that case, and throws at boot if this is still unset in
+    // production (see main.ts).
     corsOrigin,
     database: {
       host: process.env.DATABASE_HOST ?? 'localhost',

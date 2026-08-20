@@ -12,11 +12,21 @@ async function bootstrap() {
 
   app.use(helmet());
   app.setGlobalPrefix('api');
+  const nodeEnv = configService.get<string>('nodeEnv');
+  const corsOrigin = configService.get<string>('corsOrigin');
   // Security: wide-open CORS (reflect any origin) is fine for local dev, but
-  // configuration.ts's production guard guarantees corsOrigin is set whenever
-  // NODE_ENV=production, so a real deployment always locks to the actual
-  // frontend origin instead of accepting cross-origin requests from anywhere.
-  app.enableCors({ origin: configService.get<string>('corsOrigin') ?? true });
+  // fail loudly at boot if this is still unset in production — the
+  // alternative is silently falling back to that same wide-open policy for
+  // a real deployment, which defeats the point of restricting it. This
+  // guard used to live in configuration.ts, but that factory is also
+  // imported by data-source.ts (the migration CLI), which doesn't use CORS
+  // at all — putting it there broke `migration:run:prod` in production over
+  // a setting migrations never needed. It belongs here instead, right next
+  // to the one call that actually consumes corsOrigin.
+  if (nodeEnv === 'production' && !corsOrigin) {
+    throw new Error('CORS_ORIGIN must be set when NODE_ENV=production');
+  }
+  app.enableCors({ origin: corsOrigin ?? true });
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
