@@ -31,7 +31,10 @@ export default () => {
 
   return {
     nodeEnv,
-    port: parseInt(process.env.APP_PORT ?? '3000', 10),
+    // Most managed container hosts (Render, Railway, Fly) inject PORT and
+    // require the app to bind to exactly that value, overriding whatever
+    // app-level default is configured — so PORT wins over APP_PORT when set.
+    port: parseInt(process.env.PORT ?? process.env.APP_PORT ?? '3000', 10),
     timezone: process.env.APP_TIMEZONE ?? 'Asia/Manila',
     // Unset (undefined) locally — main.ts falls back to a permissive dev
     // policy in that case. Guaranteed set here whenever NODE_ENV=production,
