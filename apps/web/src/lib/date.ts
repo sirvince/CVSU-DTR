@@ -7,8 +7,19 @@ export function dayOfWeekLabel(date: string): string {
   return DAY_NAMES[new Date(`${date}T00:00:00Z`).getUTCDay()]
 }
 
+// Displays as 12-hour with AM/PM (e.g. "7:00 AM") rather than the raw
+// "HH:mm:ss"/"HH:mm" military-time string the backend stores and the
+// native <input type="time"> fields use — this only affects read-only
+// display (DtrPeriodDetailPage's calendar table, DtrDayEditorPage's
+// "Scheduled ..." hint), not the actual stored value or the time inputs
+// themselves (those stay HH:mm, since that's what type="time" requires).
 export function formatTime(time?: string | null): string {
-  return time ? time.slice(0, 5) : '—'
+  if (!time) return '—'
+  const [hoursStr, minutes] = time.slice(0, 5).split(':')
+  const hours = Number(hoursStr)
+  const period = hours >= 12 ? 'PM' : 'AM'
+  const hour12 = hours % 12 === 0 ? 12 : hours % 12
+  return `${hour12}:${minutes} ${period}`
 }
 
 function timeToMinutes(time: string): number {
