@@ -19,18 +19,17 @@ const createMockRepository = (): MockRepository => ({
 describe('DtrPeriodsService', () => {
   let service: DtrPeriodsService;
   let repository: MockRepository;
-  let academicPeriodsService: { findOneForTeacher: jest.Mock };
+  let academicPeriodsService: { findOne: jest.Mock };
 
   const academicPeriod = {
     id: 'ap-1',
-    teacherId: 'teacher-1',
     startDate: '2026-08-01',
     endDate: '2027-01-31',
   };
 
   beforeEach(async () => {
     academicPeriodsService = {
-      findOneForTeacher: jest.fn().mockResolvedValue(academicPeriod),
+      findOne: jest.fn().mockResolvedValue(academicPeriod),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -72,8 +71,8 @@ describe('DtrPeriodsService', () => {
   });
 
   describe('create', () => {
-    it('rejects when the academic period is not owned by the teacher', async () => {
-      academicPeriodsService.findOneForTeacher.mockRejectedValue(
+    it('rejects when the academic period does not exist', async () => {
+      academicPeriodsService.findOne.mockRejectedValue(
         new NotFoundException('Academic period not found'),
       );
 
@@ -138,7 +137,7 @@ describe('DtrPeriodsService', () => {
       expect(repository.save).not.toHaveBeenCalled();
     });
 
-    it('re-validates ownership when academicPeriodId changes', async () => {
+    it('re-checks the academic period exists when academicPeriodId changes', async () => {
       const existing = { id: 'dp-1', teacherId: 'teacher-1', ...dto };
       repository.findOne!.mockResolvedValue(existing);
       repository.save!.mockImplementation((p: DtrPeriod) => Promise.resolve(p));
@@ -147,10 +146,7 @@ describe('DtrPeriodsService', () => {
         academicPeriodId: 'ap-2',
       });
 
-      expect(academicPeriodsService.findOneForTeacher).toHaveBeenCalledWith(
-        'teacher-1',
-        'ap-2',
-      );
+      expect(academicPeriodsService.findOne).toHaveBeenCalledWith('ap-2');
     });
 
     it('merges changes and saves when everything is valid', async () => {

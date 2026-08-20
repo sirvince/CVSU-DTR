@@ -22,10 +22,10 @@ const createMockRepository = (): MockRepository => ({
 describe('SchedulesService', () => {
   let service: SchedulesService;
   let repository: MockRepository;
-  let academicPeriodsService: { findOneForTeacher: jest.Mock };
+  let academicPeriodsService: { findOne: jest.Mock };
 
   beforeEach(async () => {
-    academicPeriodsService = { findOneForTeacher: jest.fn() };
+    academicPeriodsService = { findOne: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -77,8 +77,8 @@ describe('SchedulesService', () => {
   });
 
   describe('create', () => {
-    it('rejects when the academic period is not owned by the teacher', async () => {
-      academicPeriodsService.findOneForTeacher.mockRejectedValue(
+    it('rejects when the academic period does not exist', async () => {
+      academicPeriodsService.findOne.mockRejectedValue(
         new NotFoundException('Academic period not found'),
       );
 
@@ -89,7 +89,7 @@ describe('SchedulesService', () => {
     });
 
     it('rejects when startTime is not before endTime', async () => {
-      academicPeriodsService.findOneForTeacher.mockResolvedValue({
+      academicPeriodsService.findOne.mockResolvedValue({
         id: 'period-1',
       });
 
@@ -103,8 +103,8 @@ describe('SchedulesService', () => {
       expect(repository.save).not.toHaveBeenCalled();
     });
 
-    it('creates the schedule scoped to the teacher once ownership is confirmed', async () => {
-      academicPeriodsService.findOneForTeacher.mockResolvedValue({
+    it('creates the schedule scoped to the teacher once the period is confirmed to exist', async () => {
+      academicPeriodsService.findOne.mockResolvedValue({
         id: 'period-1',
       });
       const created = { ...dto, teacherId: 'teacher-1' };
@@ -112,10 +112,7 @@ describe('SchedulesService', () => {
       repository.save!.mockResolvedValue(created);
 
       await expect(service.create('teacher-1', dto)).resolves.toBe(created);
-      expect(academicPeriodsService.findOneForTeacher).toHaveBeenCalledWith(
-        'teacher-1',
-        'period-1',
-      );
+      expect(academicPeriodsService.findOne).toHaveBeenCalledWith('period-1');
       expect(repository.create).toHaveBeenCalledWith({
         ...dto,
         startTime: '07:00:00',
@@ -125,7 +122,7 @@ describe('SchedulesService', () => {
     });
 
     it('translates a duplicate day/period DB error into ConflictException', async () => {
-      academicPeriodsService.findOneForTeacher.mockResolvedValue({
+      academicPeriodsService.findOne.mockResolvedValue({
         id: 'period-1',
       });
       repository.create!.mockReturnValue({ ...dto, teacherId: 'teacher-1' });
@@ -138,7 +135,7 @@ describe('SchedulesService', () => {
   });
 
   describe('update', () => {
-    it('re-validates ownership only when academicPeriodId actually changes', async () => {
+    it('re-checks the academic period only when academicPeriodId actually changes', async () => {
       const existing = { id: 'sched-1', teacherId: 'teacher-1', ...dto };
       repository.findOne!.mockResolvedValue(existing);
       repository.save!.mockImplementation((s: TeacherSchedule) =>
@@ -147,13 +144,13 @@ describe('SchedulesService', () => {
 
       await service.update('teacher-1', 'sched-1', { startTime: '08:00' });
 
-      expect(academicPeriodsService.findOneForTeacher).not.toHaveBeenCalled();
+      expect(academicPeriodsService.findOne).not.toHaveBeenCalled();
     });
 
-    it('re-validates ownership when academicPeriodId changes', async () => {
+    it('re-checks the academic period exists when academicPeriodId changes', async () => {
       const existing = { id: 'sched-1', teacherId: 'teacher-1', ...dto };
       repository.findOne!.mockResolvedValue(existing);
-      academicPeriodsService.findOneForTeacher.mockResolvedValue({
+      academicPeriodsService.findOne.mockResolvedValue({
         id: 'period-2',
       });
       repository.save!.mockImplementation((s: TeacherSchedule) =>
@@ -164,10 +161,7 @@ describe('SchedulesService', () => {
         academicPeriodId: 'period-2',
       });
 
-      expect(academicPeriodsService.findOneForTeacher).toHaveBeenCalledWith(
-        'teacher-1',
-        'period-2',
-      );
+      expect(academicPeriodsService.findOne).toHaveBeenCalledWith('period-2');
     });
 
     it('rejects an update that makes the time range invalid', async () => {

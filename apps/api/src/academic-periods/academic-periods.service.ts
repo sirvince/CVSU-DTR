@@ -21,19 +21,18 @@ export class AcademicPeriodsService {
     private readonly academicPeriodRepository: Repository<AcademicPeriod>,
   ) {}
 
-  findAllForTeacher(teacherId: string): Promise<AcademicPeriod[]> {
+  // Shared resource — no ownership filter. Any authenticated teacher can
+  // read the list (see academic-periods.controller.ts); only ADMIN can
+  // write (enforced by RolesGuard at the controller, not here).
+  findAll(): Promise<AcademicPeriod[]> {
     return this.academicPeriodRepository.find({
-      where: { teacherId },
       order: { startDate: 'DESC' },
     });
   }
 
-  async findOneForTeacher(
-    teacherId: string,
-    id: string,
-  ): Promise<AcademicPeriod> {
+  async findOne(id: string): Promise<AcademicPeriod> {
     const period = await this.academicPeriodRepository.findOne({
-      where: { id, teacherId },
+      where: { id },
     });
     if (!period) {
       throw new NotFoundException('Academic period not found');
@@ -42,31 +41,30 @@ export class AcademicPeriodsService {
   }
 
   async create(
-    teacherId: string,
+    createdByUserId: string,
     dto: CreateAcademicPeriodDto,
   ): Promise<AcademicPeriod> {
     this.assertValidDateRange(dto.startDate, dto.endDate);
 
     const period = this.academicPeriodRepository.create({
       ...dto,
-      teacherId,
+      createdByUserId,
     });
     return this.save(period);
   }
 
   async update(
-    teacherId: string,
     id: string,
     dto: UpdateAcademicPeriodDto,
   ): Promise<AcademicPeriod> {
-    const period = await this.findOneForTeacher(teacherId, id);
+    const period = await this.findOne(id);
     Object.assign(period, dto);
     this.assertValidDateRange(period.startDate, period.endDate);
     return this.save(period);
   }
 
-  async remove(teacherId: string, id: string): Promise<void> {
-    const period = await this.findOneForTeacher(teacherId, id);
+  async remove(id: string): Promise<void> {
+    const period = await this.findOne(id);
     await this.academicPeriodRepository.remove(period);
   }
 

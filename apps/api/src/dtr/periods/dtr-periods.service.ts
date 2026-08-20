@@ -49,8 +49,9 @@ export class DtrPeriodsService {
   }
 
   async create(teacherId: string, dto: CreateDtrPeriodDto): Promise<DtrPeriod> {
-    const academicPeriod = await this.academicPeriodsService.findOneForTeacher(
-      teacherId,
+    // academic-periods is a shared resource now (any teacher may reference
+    // any period) — this is a plain existence check, not an ownership one.
+    const academicPeriod = await this.academicPeriodsService.findOne(
       dto.academicPeriodId,
     );
     this.assertValidDateRange(dto.startDate, dto.endDate);
@@ -72,8 +73,7 @@ export class DtrPeriodsService {
       dto.academicPeriodId &&
       dto.academicPeriodId !== period.academicPeriodId
     ) {
-      academicPeriod = await this.academicPeriodsService.findOneForTeacher(
-        teacherId,
+      academicPeriod = await this.academicPeriodsService.findOne(
         dto.academicPeriodId,
       );
     }
@@ -81,8 +81,7 @@ export class DtrPeriodsService {
     Object.assign(period, dto);
     this.assertValidDateRange(period.startDate, period.endDate);
 
-    academicPeriod ??= await this.academicPeriodsService.findOneForTeacher(
-      teacherId,
+    academicPeriod ??= await this.academicPeriodsService.findOne(
       period.academicPeriodId,
     );
     this.assertWithinAcademicPeriod(

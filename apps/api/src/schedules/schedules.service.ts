@@ -54,10 +54,9 @@ export class SchedulesService {
     teacherId: string,
     dto: CreateTeacherScheduleDto,
   ): Promise<TeacherSchedule> {
-    await this.academicPeriodsService.findOneForTeacher(
-      teacherId,
-      dto.academicPeriodId,
-    );
+    // academic-periods is a shared resource now (any teacher may reference
+    // any period) — this is a plain existence check, not an ownership one.
+    await this.academicPeriodsService.findOne(dto.academicPeriodId);
     const startTime = this.normalizeTime(dto.startTime);
     const endTime = this.normalizeTime(dto.endTime);
     this.assertValidTimeRange(startTime, endTime);
@@ -82,10 +81,7 @@ export class SchedulesService {
       dto.academicPeriodId &&
       dto.academicPeriodId !== schedule.academicPeriodId
     ) {
-      await this.academicPeriodsService.findOneForTeacher(
-        teacherId,
-        dto.academicPeriodId,
-      );
+      await this.academicPeriodsService.findOne(dto.academicPeriodId);
     }
 
     Object.assign(schedule, {

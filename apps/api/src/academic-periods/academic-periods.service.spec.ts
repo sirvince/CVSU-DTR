@@ -43,45 +43,45 @@ describe('AcademicPeriodsService', () => {
     endDate: '2027-01-31',
   };
 
-  describe('findAllForTeacher', () => {
-    it('scopes the query to the given teacher', async () => {
+  // Shared resource: no teacher-scoping in any of these anymore — every
+  // authenticated teacher reads the same list, only an ADMIN (enforced by
+  // RolesGuard at the controller, not here) can write.
+  describe('findAll', () => {
+    it('returns every period, ordered by startDate desc', async () => {
       repository.find!.mockResolvedValue([]);
 
-      await service.findAllForTeacher('teacher-1');
+      await service.findAll();
 
       expect(repository.find).toHaveBeenCalledWith({
-        where: { teacherId: 'teacher-1' },
         order: { startDate: 'DESC' },
       });
     });
   });
 
-  describe('findOneForTeacher', () => {
-    it('throws NotFoundException when no matching row for that teacher exists', async () => {
+  describe('findOne', () => {
+    it('throws NotFoundException when no matching row exists', async () => {
       repository.findOne!.mockResolvedValue(null);
 
-      await expect(
-        service.findOneForTeacher('teacher-1', 'period-1'),
-      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.findOne('period-1')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
       expect(repository.findOne).toHaveBeenCalledWith({
-        where: { id: 'period-1', teacherId: 'teacher-1' },
+        where: { id: 'period-1' },
       });
     });
 
-    it('returns the period when owned by the teacher', async () => {
-      const period = { id: 'period-1', teacherId: 'teacher-1' };
+    it('returns the period when found', async () => {
+      const period = { id: 'period-1' };
       repository.findOne!.mockResolvedValue(period);
 
-      await expect(
-        service.findOneForTeacher('teacher-1', 'period-1'),
-      ).resolves.toBe(period);
+      await expect(service.findOne('period-1')).resolves.toBe(period);
     });
   });
 
   describe('create', () => {
     it('rejects when startDate is not before endDate', async () => {
       await expect(
-        service.create('teacher-1', {
+        service.create('admin-1', {
           ...dto,
           startDate: '2027-01-31',
           endDate: '2026-08-01',
@@ -90,23 +90,26 @@ describe('AcademicPeriodsService', () => {
       expect(repository.save).not.toHaveBeenCalled();
     });
 
-    it('creates the period scoped to the teacher', async () => {
-      const created = { ...dto, teacherId: 'teacher-1' };
+    it('creates the period, stamping createdByUserId for audit only', async () => {
+      const created = { ...dto, createdByUserId: 'admin-1' };
       repository.create!.mockReturnValue(created);
       repository.save!.mockResolvedValue(created);
 
-      await expect(service.create('teacher-1', dto)).resolves.toBe(created);
+      await expect(service.create('admin-1', dto)).resolves.toBe(created);
       expect(repository.create).toHaveBeenCalledWith({
         ...dto,
-        teacherId: 'teacher-1',
+        createdByUserId: 'admin-1',
       });
     });
 
     it('translates a duplicate year/semester DB error into ConflictException', async () => {
-      repository.create!.mockReturnValue({ ...dto, teacherId: 'teacher-1' });
+      repository.create!.mockReturnValue({
+        ...dto,
+        createdByUserId: 'admin-1',
+      });
       repository.save!.mockRejectedValue({ code: 'ER_DUP_ENTRY' });
 
-      await expect(service.create('teacher-1', dto)).rejects.toMatchObject({
+      await expect(service.create('admin-1', dto)).rejects.toMatchObject({
         status: 409,
       });
     });
@@ -114,13 +117,13 @@ describe('AcademicPeriodsService', () => {
 
   describe('update', () => {
     it('merges changes, re-validates the date range, and saves', async () => {
-      const existing = { id: 'period-1', teacherId: 'teacher-1', ...dto };
+      const existing = { id: 'period-1', ...dto };
       repository.findOne!.mockResolvedValue(existing);
       repository.save!.mockImplementation((p: AcademicPeriod) =>
         Promise.resolve(p),
       );
 
-      const result = await service.update('teacher-1', 'period-1', {
+      const result = await service.update('period-1', {
         semester: '2nd Semester',
       });
 
@@ -128,32 +131,32 @@ describe('AcademicPeriodsService', () => {
     });
 
     it('rejects an update that makes the date range invalid', async () => {
-      const existing = { id: 'period-1', teacherId: 'teacher-1', ...dto };
+      const existing = { id: 'period-1', ...dto };
       repository.findOne!.mockResolvedValue(existing);
 
       await expect(
-        service.update('teacher-1', 'period-1', { startDate: '2027-06-01' }),
+        service.update('period-1', { startDate: '2027-06-01' }),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(repository.save).not.toHaveBeenCalled();
     });
   });
 
   describe('remove', () => {
-    it('throws NotFoundException when removing a period not owned by the teacher', async () => {
+    it('throws NotFoundException when the period does not exist', async () => {
       repository.findOne!.mockResolvedValue(null);
 
-      await expect(
-        service.remove('teacher-1', 'period-1'),
-      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.remove('period-1')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
       expect(repository.remove).not.toHaveBeenCalled();
     });
 
-    it('removes the period when owned by the teacher', async () => {
-      const existing = { id: 'period-1', teacherId: 'teacher-1' };
+    it('removes the period when found', async () => {
+      const existing = { id: 'period-1' };
       repository.findOne!.mockResolvedValue(existing);
       repository.remove!.mockResolvedValue(existing);
 
-      await service.remove('teacher-1', 'period-1');
+      await service.remove('period-1');
 
       expect(repository.remove).toHaveBeenCalledWith(existing);
     });
